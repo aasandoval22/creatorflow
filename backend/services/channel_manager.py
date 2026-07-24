@@ -1,10 +1,59 @@
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_FILE = PROJECT_ROOT / "backend" / "config" / "channels.json"
+
+
+def normalize_youtube_channel_url(channel_url: str) -> str:
+    """Validate and normalize a supported YouTube channel URL."""
+
+    if not isinstance(channel_url, str) or not channel_url.strip():
+        raise ValueError("must be a non-blank string")
+
+    parsed = urlsplit(channel_url.strip())
+
+    if parsed.scheme != "https":
+        raise ValueError("must use https")
+
+    if parsed.hostname not in {"youtube.com", "www.youtube.com"}:
+        raise ValueError("must use the youtube.com host")
+
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("contains an invalid port") from error
+
+    if parsed.username is not None or parsed.password is not None or port:
+        raise ValueError("must not contain credentials or a port")
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    if path_parts and path_parts[-1].lower() == "videos":
+        path_parts.pop()
+
+    valid_handle = (
+        len(path_parts) == 1
+        and path_parts[0].startswith("@")
+        and len(path_parts[0]) > 1
+    )
+    valid_legacy_path = (
+        len(path_parts) == 2
+        and path_parts[0] in {"channel", "c", "user"}
+        and bool(path_parts[1].strip())
+    )
+
+    if not (valid_handle or valid_legacy_path):
+        raise ValueError(
+            "must identify a channel using /@handle, /channel/ID, "
+            "/c/name, or /user/name"
+        )
+
+    normalized_path = "/" + "/".join(path_parts)
+    return urlunsplit(("https", "www.youtube.com", normalized_path, "", ""))
 
 
 class ChannelManager:
@@ -29,6 +78,12 @@ class ChannelManager:
                 f"Invalid JSON in {self.config_file}: {error}"
             ) from error
 
+        if not isinstance(config, dict):
+            raise ValueError(
+                "Channel configuration must be a JSON object containing "
+                "a 'channels' list."
+            )
+
         channels = config.get("channels")
 
         if not isinstance(channels, list):
@@ -37,9 +92,28 @@ class ChannelManager:
             )
 
         validated_channels = []
+        seen_names: dict[str, int] = {}
+        seen_urls: dict[str, int] = {}
 
         for index, channel in enumerate(channels, start=1):
-            self._validate_channel(channel, index)
+            normalized_url = self._validate_channel(channel, index)
+            normalized_name = channel["name"].strip().casefold()
+
+            if normalized_name in seen_names:
+                raise ValueError(
+                    f"Channel entry {index} duplicates the name from "
+                    f"entry {seen_names[normalized_name]}: {channel['name']!r}."
+                )
+
+            if normalized_url in seen_urls:
+                raise ValueError(
+                    f"Channel entry {index} duplicates the YouTube URL from "
+                    f"entry {seen_urls[normalized_url]}: "
+                    f"{channel['youtube_url']!r}."
+                )
+
+            seen_names[normalized_name] = index
+            seen_urls[normalized_url] = index
             validated_channels.append(channel)
 
         return validated_channels
@@ -56,8 +130,8 @@ class ChannelManager:
         ]
 
     @staticmethod
-    def _validate_channel(channel: Any, index: int) -> None:
-        """Validate one channel entry from the JSON configuration."""
+    def _validate_channel(channel: Any, index: int) -> str:
+        """Validate one channel entry and return its normalized URL."""
 
         if not isinstance(channel, dict):
             raise ValueError(
@@ -88,13 +162,13 @@ class ChannelManager:
                 f"Channel entry {index} has an empty name."
             )
 
-        if not channel["youtube_url"].startswith(
-            ("https://www.youtube.com/", "https://youtube.com/")
-        ):
+        try:
+            return normalize_youtube_channel_url(channel["youtube_url"])
+        except ValueError as error:
             raise ValueError(
-                f"Channel entry {index} does not contain "
-                "a valid YouTube URL."
-            )
+                f"Channel entry {index} field 'youtube_url' is invalid: "
+                f"{error}."
+            ) from error
 
 
 def main() -> None:
