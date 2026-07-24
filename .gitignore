@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables
+.env
+
+# Databases
+*.db
+
+# Generated media
+downloads/
+processed/
+clips/
+review/
+
+# Logs
+logs/
+
+# macOS
+.DS_Store
