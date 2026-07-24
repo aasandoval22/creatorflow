@@ -1,25 +1,32 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
 
 # Virtual environments
 .venv/
 venv/
 
-# Environment variables
+# Environment variables and secrets
 .env
+.env.*
 
 # Databases
 *.db
+*.sqlite
+*.sqlite3
 
-# Generated media
-downloads/
-processed/
-clips/
-review/
+# Generated media and application data
+data/downloads/
+data/processed/
+data/clips/
+data/review/
+data/logs/
+data/database/
 
-# Logs
-logs/
+# Temporary files
+*.tmp
+*.part
 
 # macOS
 .DS_Store
