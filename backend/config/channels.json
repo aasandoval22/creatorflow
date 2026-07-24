@@ -3,7 +3,7 @@
     {
       "name": "ZkMushroom",
       "youtube_url": "https://www.youtube.com/@ZkMushroom",
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "Datto",
@@ -13,7 +13,7 @@
     {
       "name": "Aztecross",
       "youtube_url": "https://www.youtube.com/@AztecrossGaming",
-      "enabled": true
+      "enabled": false
     }
   ]
 }
