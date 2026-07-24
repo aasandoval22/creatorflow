@@ -12,3 +12,12 @@ CreatorFlow is an AI-powered content clipping platform that automatically:
 
 🚧 Currently under development.
 # creatorflow
+
+
+## Offline tests
+
+Install the development dependencies, then run:
+
+```bash
+pytest
+```
