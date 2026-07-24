@@ -6,12 +6,14 @@ import yt_dlp
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOWNLOAD_DIRECTORY = PROJECT_ROOT / "data" / "downloads"
+ARCHIVE_DIRECTORY = PROJECT_ROOT / "data" / "database"
 
 
 def download_video(video_url: str) -> None:
     """Download one YouTube video into the project downloads folder."""
 
     DOWNLOAD_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
     options = {
         "outtmpl": str(
@@ -23,6 +25,9 @@ def download_video(video_url: str) -> None:
         "merge_output_format": "mp4",
         "restrictfilenames": True,
         "noplaylist": True,
+        "download_archive": str(
+            ARCHIVE_DIRECTORY / "downloaded_videos.txt"
+        ),
     }
 
     print(f"Downloading to: {DOWNLOAD_DIRECTORY}")
