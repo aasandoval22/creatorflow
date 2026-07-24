@@ -1,0 +1,19 @@
+{
+  "channels": [
+    {
+      "name": "ZkMushroom",
+      "url": "https://www.youtube.com/@ZkMushroom",
+      "enabled": true
+    },
+    {
+      "name": "Datto",
+      "url": "https://www.youtube.com/@DattoDoesDestiny",
+      "enabled": true
+    },
+    {
+      "name": "Aztecross",
+      "url": "https://www.youtube.com/@AztecrossGaming",
+      "enabled": true
+    }
+  ]
+}
