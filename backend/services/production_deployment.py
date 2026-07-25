@@ -41,6 +41,11 @@ class ProcessResult:
 ProcessRunner = Callable[[Sequence[str], Path | None], ProcessResult]
 
 
+def _absolute_path(path: Path | str) -> Path:
+    """Make a launcher path absolute without dereferencing symlinks."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
 def run_process(command: Sequence[str], cwd: Path | None = None) -> ProcessResult:
     try:
         result = subprocess.run(
@@ -101,10 +106,12 @@ class ProductionDeployer:
             else (HOME / ".config" / "systemd" / "user").resolve()
         )
         self.runner = runner
-        self.python_executable = Path(
+        self.python_executable = _absolute_path(
             python_executable or self.development_root / ".venv" / "bin" / "python"
-        ).resolve()
-        self.deno_path = Path(deno_path or HOME / ".deno" / "bin" / "deno").resolve()
+        )
+        self.deno_path = _absolute_path(
+            deno_path or HOME / ".deno" / "bin" / "deno"
+        )
 
     @property
     def releases_root(self) -> Path:
@@ -168,6 +175,18 @@ class ProductionDeployer:
         if mode != 0o600:
             raise DeploymentError(
                 f"Private environment file must have mode 0600, found {mode:04o}."
+            )
+
+    def _ensure_development_launcher(self) -> None:
+        if not self.python_executable.is_file():
+            raise DeploymentError(
+                f"Development virtual-environment Python is missing: "
+                f"{self.python_executable}."
+            )
+        if not os.access(self.python_executable, os.X_OK):
+            raise DeploymentError(
+                f"Development virtual-environment Python is not executable: "
+                f"{self.python_executable}."
             )
 
     def _prepare_persistent_data(self) -> None:
@@ -358,6 +377,7 @@ class ProductionDeployer:
     def deploy(self, *, interval: str = "30m") -> dict[str, Any]:
         commit = self.require_deployable_checkout()
         self._ensure_private_environment()
+        self._ensure_development_launcher()
         self._prepare_persistent_data()
         previous = self.deployed_commit()
         release, created = self._prepare_release(commit)

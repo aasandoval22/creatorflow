@@ -18,6 +18,7 @@ venv/
 *.sqlite3
 
 # Generated media and application data
+/data
 data/downloads/
 data/processed/
 data/clips/
