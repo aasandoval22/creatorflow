@@ -57,3 +57,41 @@ video ID. A `discovered` record has metadata but no confirmed local media;
 `skipped` means yt-dlp did not download the video, such as when its archive
 already contains it; and `failed` includes an error message for a failed
 ingestion attempt.
+
+## Local transcription
+
+Install the optional transcription runtime separately from development
+dependencies:
+
+```bash
+python -m pip install -r backend/requirements-transcription.txt
+```
+
+Transcribe eligible downloaded videos with the production defaults:
+
+```bash
+python -m backend.app.transcribe_videos
+```
+
+The defaults are the English `base.en` model on `cpu` with `int8` compute,
+English language selection, word timestamps, VAD filtering, and beam size 5.
+The first real use may download the selected model if it is not already
+available locally.
+
+Selection and retry examples:
+
+```bash
+python -m backend.app.transcribe_videos --video-id VIDEO_ID
+python -m backend.app.transcribe_videos --limit 3
+python -m backend.app.transcribe_videos --retry-failed
+python -m backend.app.transcribe_videos --force
+```
+
+Each video produces `transcript.json`, `transcript.txt`, and `subtitles.srt`
+under `data/transcripts/<video_id>/`. The JSON artifact contains versioned
+segment and word timestamps, the text file contains a clean readable
+transcript, and the SRT file contains numbered subtitle blocks.
+
+The regular offline test suite injects fake models and uses temporary local
+files. It does not install or load faster-whisper, download model files,
+decode real media, or perform real transcription.
