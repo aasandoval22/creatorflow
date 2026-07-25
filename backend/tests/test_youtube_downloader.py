@@ -4,7 +4,7 @@ import pytest
 
 from backend.services.video_manifest import VideoStatus
 from backend.services.youtube_downloader import (
-    DownloadResult, DownloadStatus, YouTubeDownloader,
+    DownloadResult, DownloadStatus, YouTubeDownloader, find_deno_executable,
 )
 
 
@@ -26,12 +26,21 @@ def metadata(video_id="abc", **overrides):
     return value
 
 
+def executable_deno(tmp_path):
+    path = tmp_path / ".deno" / "bin" / "deno"
+    path.parent.mkdir(parents=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o700)
+    return path
+
+
 @pytest.fixture
 def downloader(tmp_path):
     return YouTubeDownloader(
         tmp_path / "downloads",
         tmp_path / "archive",
         tmp_path / "manifests" / "videos.json",
+        deno_path=executable_deno(tmp_path),
     )
 
 
@@ -56,6 +65,50 @@ def youtube_dl_instances(metadata_value, download_action=0, filename=None):
         side_effect=[metadata_instance, download_instance],
     )
     return mocked, metadata_instance, download_instance
+
+
+def test_detects_existing_explicit_deno_executable(tmp_path, monkeypatch):
+    deno = executable_deno(tmp_path)
+    monkeypatch.setenv("PATH", "")
+    assert find_deno_executable(deno) == deno
+
+
+def test_options_explicitly_configure_deno_for_metadata_and_download(tmp_path):
+    deno = executable_deno(tmp_path)
+    downloader = YouTubeDownloader(discovery_only=True, deno_path=deno)
+    expected = {"deno": {"path": str(deno)}}
+    assert downloader._metadata_options()["js_runtimes"] == expected
+    assert downloader._build_options()["js_runtimes"] == expected
+
+
+def test_standard_deno_path_works_without_interactive_path(tmp_path, monkeypatch):
+    deno = executable_deno(tmp_path)
+    monkeypatch.setattr(
+        "backend.services.youtube_downloader.DEFAULT_DENO_PATH", deno
+    )
+    monkeypatch.delenv("AUTOCLIP_DENO_PATH", raising=False)
+    monkeypatch.setattr(
+        "backend.services.youtube_downloader.shutil.which", lambda _name: None
+    )
+    downloader = YouTubeDownloader(discovery_only=True)
+    assert downloader.deno_path == deno
+    assert downloader._metadata_options()["js_runtimes"]["deno"]["path"] == str(deno)
+
+
+def test_missing_deno_warns_and_preserves_yt_dlp_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "backend.services.youtube_downloader.DEFAULT_DENO_PATH",
+        tmp_path / "missing-deno",
+    )
+    monkeypatch.delenv("AUTOCLIP_DENO_PATH", raising=False)
+    monkeypatch.setattr(
+        "backend.services.youtube_downloader.shutil.which", lambda _name: None
+    )
+    with pytest.warns(RuntimeWarning, match="Deno JavaScript runtime was not found"):
+        downloader = YouTubeDownloader(discovery_only=True)
+    assert downloader.deno_path is None
+    assert "js_runtimes" not in downloader._metadata_options()
+    assert "js_runtimes" not in downloader._build_options()
 
 
 def test_uses_injected_directories_and_preserves_archive_options(downloader):

@@ -134,6 +134,13 @@ AUTOCLIP_PRODUCTION_ARGS=--max-videos 2 --top 2
 AUTOCLIP_REVIEW_ARGS=--port 8080
 ```
 
+YouTube discovery and downloads explicitly configure yt-dlp's Deno JavaScript
+runtime. CreatorFlow checks `AUTOCLIP_DENO_PATH`, then
+`~/.deno/bin/deno`, then `PATH`. This gives interactive and systemd-managed
+runs identical behavior even when the user service PATH omits the Deno install
+directory. If no executable runtime is available, yt-dlp continues with a
+clear warning because Deno is optional in offline development environments.
+
 Keep the review server loopback-bound. The managed unit always supplies
 `--host 127.0.0.1`; use an SSH tunnel for remote browser access as described
 below. Do not put secrets in the environment file unless the local host
