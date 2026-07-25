@@ -432,6 +432,69 @@ access. The current workflow is ingestion → transcription → candidate analys
 → preview rendering → local review → accepted-reference comparison → human
 timing/decision changes when warranted.
 
+## Gaming reference discovery
+
+CreatorFlow can search the official YouTube Data API for public gaming Shorts,
+hydrate changing engagement statistics, verify shortlisted media locally, and
+place a diverse top set into a separate human reference-review queue. Discovery
+never accepts a reference, changes a profile, or affects production selection.
+
+Configure an API key only in the existing private environment file:
+
+```text
+YOUTUBE_DATA_API_KEY=your-key-value
+```
+
+The file is `~/.config/creatorflow/creatorflow.env` and must have mode `0600`.
+The CLI also accepts an already-exported `YOUTUBE_DATA_API_KEY`; it never prints
+the value. With no configured key, discovery exits with an actionable error.
+
+Commands:
+
+```bash
+.venv/bin/python -m backend.services.reference_discovery discover --dry-run
+.venv/bin/python -m backend.services.reference_discovery discover
+.venv/bin/python -m backend.services.reference_discovery list
+.venv/bin/python -m backend.services.reference_discovery list --status rejected
+.venv/bin/python -m backend.services.reference_discovery show VIDEO_ID
+.venv/bin/python -m backend.services.reference_discovery refresh-stats
+.venv/bin/python -m backend.services.reference_discovery validate
+```
+
+Discovery uses several documented default searches: funny gaming moments,
+streamer reactions, competitive clutches, gaming failures, gaming challenges,
+and horror-game reactions. Configure the target count, source pool,
+publication window, region, creator/topic caps, queries, and media retention
+with `discover --help`. The defaults select 20 candidates, cap a creator at
+two, cap an inferred game/topic at three, and retain selected local previews.
+A dry run performs API search, hydration, and ranking planning but does not
+download media or mutate review state.
+
+Ranking model version 1 has visible components for logarithmic raw views,
+views per day, like/view and comment/view ratios when available, recency,
+duration suitability, verified vertical composition, and missing-evidence
+penalties. Near-identical normalized titles are deduplicated, then creator and
+inferred-topic caps are applied. These heuristics help triage public evidence;
+they do not predict virality or objectively measure quality.
+
+Normal discovery locally downloads a shortlist and uses FFprobe to require a
+playable video stream, audio stream, approximately vertical composition, and a
+5–180 second duration. Search results alone are never treated as proof that a
+video is a Short. Metadata snapshots, scores, validation results, review state,
+and retained media are stored atomically under ignored
+`data/reference_discovery/`.
+
+Open `/reference-candidates` on the existing loopback review server. Each card
+shows the public source, local preview when retained, creator, publication and
+capture times, statistics, ranking evidence, media measurements, and any
+available analysis. A reviewer can leave notes, assign a category, reject,
+mark a duplicate, or accept. Acceptance creates a distinguishable
+`automatic_youtube_discovery` source snapshot and then uses the existing strict
+reference registration and analysis pipeline. Profile rebuilding remains a
+separate explicit action. Rejected and merely discovered candidates never
+influence profiles. No discovery or review action republishes, remixes, or
+uploads media.
+
 ### Review-time timing correction
 
 Transcript boundaries are useful for finding a spoken moment, but visual

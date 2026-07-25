@@ -7,6 +7,7 @@ import hmac
 import html
 import ipaddress
 import json
+import re
 import secrets
 import socket
 import sys
@@ -27,6 +28,10 @@ from backend.services.clip_timing_adjustment import ClipTimingAdjustmentService
 from backend.services.reference_clip_comparator import ReferenceClipComparator
 from backend.services.reference_clip_library import ReferenceClipLibrary
 from backend.services.reference_profile_builder import ReferenceProfileBuilder
+from backend.services.reference_discovery import (
+    ReferenceCandidateQueue, ReferenceDiscoveryError, ReferenceDiscoveryService,
+    YouTubeDataAPI,
+)
 from backend.services.video_manifest import DEFAULT_MANIFEST_PATH
 from backend.services.video_preview_renderer import (
     DEFAULT_PREVIEW_DIRECTORY, SAFE_PRESETS, CaptionConfiguration,
@@ -73,6 +78,8 @@ class ReviewApplication:
     maximum_duration: float = 60.0
     reference_comparator: ReferenceClipComparator | None = None
     reference_profile: str = "personality_reaction"
+    reference_candidate_queue: ReferenceCandidateQueue | None = None
+    reference_discovery_service: ReferenceDiscoveryService | None = None
 
 
 class ReviewHTTPServer(ThreadingHTTPServer):
@@ -121,6 +128,12 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         route = urlsplit(self.path)
         if route.path == "/":
             self._index(route.query, head=False)
+        elif route.path == "/reference-candidates":
+            self._reference_candidates(route.query, head=False)
+        elif route.path.startswith("/reference-media/"):
+            self._reference_media(
+                route.path.removeprefix("/reference-media/"), head=False
+            )
         elif route.path.startswith("/media/"):
             self._media(route.path.removeprefix("/media/"), head=False)
         elif self._write_route(route.path):
@@ -132,6 +145,12 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         route = urlsplit(self.path)
         if route.path == "/":
             self._index(route.query, head=True)
+        elif route.path == "/reference-candidates":
+            self._reference_candidates(route.query, head=True)
+        elif route.path.startswith("/reference-media/"):
+            self._reference_media(
+                route.path.removeprefix("/reference-media/"), head=True
+            )
         elif route.path.startswith("/media/"):
             self._media(route.path.removeprefix("/media/"), head=True)
         elif self._write_route(route.path):
@@ -141,6 +160,10 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
+        reference_route = self._reference_write_route(path)
+        if reference_route is not None:
+            self._reference_decision(*reference_route)
+            return
         if path.startswith("/media/"):
             self._text(HTTPStatus.METHOD_NOT_ALLOWED, "Preview media is read-only.")
             return
@@ -200,6 +223,17 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             review_id = parts[1]
             if review_id and "/" not in review_id and review_id.startswith("review_"):
                 return review_id, parts[2]
+        return None
+
+    @staticmethod
+    def _reference_write_route(path: str) -> tuple[str, str] | None:
+        parts = path.strip("/").split("/")
+        if (
+            len(parts) == 3 and parts[0] == "reference-candidates"
+            and parts[2] == "decision"
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", parts[1])
+        ):
+            return parts[1], parts[2]
         return None
 
     def _form(self) -> dict[str, list[str]]:
@@ -356,6 +390,63 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             f"{self.server.app.reference_profile}; review state was unchanged."
         )
 
+    def _reference_decision(self, video_id: str, _route: str) -> None:
+        queue = self.server.app.reference_candidate_queue
+        service = self.server.app.reference_discovery_service
+        if queue is None:
+            self._text(HTTPStatus.NOT_FOUND, "Reference discovery is not configured.")
+            return
+        try:
+            form = self._form()
+            self._require_token(form)
+            action = self._one(form, "action", required=True)
+            note = self._one(form, "note") or ""
+            category = self._one(form, "category") or "gaming_highlight"
+            if len(note) > MAX_NOTE:
+                raise RequestError(
+                    HTTPStatus.BAD_REQUEST,
+                    f"Review notes are limited to {MAX_NOTE} characters.",
+                )
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", category):
+                raise RequestError(HTTPStatus.BAD_REQUEST, "Invalid reference category.")
+            if action == "accept":
+                if service is None:
+                    raise ReferenceDiscoveryError(
+                        "Reference acceptance is not configured."
+                    )
+                service.accept(
+                    video_id, category=category, notes=note,
+                    transcription=False,
+                )
+                message = f"{video_id} was accepted and registered as a reference."
+            elif action in {"reject", "duplicate", "discovered"}:
+                queue.decide(
+                    video_id, action, notes=note, category=category
+                )
+                message = f"{video_id} is now {action}."
+            else:
+                raise RequestError(HTTPStatus.BAD_REQUEST, "Invalid reference action.")
+        except RequestError as error:
+            self._text(error.status, error.message)
+            return
+        except (ReferenceDiscoveryError, OSError, ValueError) as error:
+            self.log_error("reference candidate request failed: %s", error)
+            self._reference_redirect(
+                "error", "Reference action failed; existing state was preserved."
+            )
+            return
+        self._reference_redirect("success", message)
+
+    def _reference_redirect(self, kind: str, message: str) -> None:
+        location = "/reference-candidates?" + urlencode({kind: message})
+        self.send_response(HTTPStatus.SEE_OTHER)
+        for name, value in SECURITY_HEADERS.items():
+            self.send_header(name, value)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _redirect(self, kind: str, message: str) -> None:
         location = "/?" + urlencode({kind: message})
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -412,6 +503,84 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
         return reports
+
+    def _reference_candidates(self, query: str, *, head: bool) -> None:
+        queue = self.server.app.reference_candidate_queue
+        if queue is None:
+            self._text(
+                HTTPStatus.NOT_FOUND, "Reference discovery is not configured.",
+                head=head,
+            )
+            return
+        try:
+            parameters = parse_qs(query)
+            status = parameters.get("status", [None])[0]
+            items = queue.list(status=status)
+            body = render_reference_candidates(
+                items, self.server.app.form_token,
+                notice=parameters.get("success", parameters.get("error", [None]))[0],
+                notice_error="error" in parameters,
+            ).encode()
+        except (ReferenceDiscoveryError, OSError, ValueError) as error:
+            self._text(HTTPStatus.BAD_REQUEST, str(error), head=head)
+            return
+        self._headers(HTTPStatus.OK, "text/html; charset=utf-8", len(body))
+        if not head:
+            self.wfile.write(body)
+
+    def _reference_media(self, video_id: str, *, head: bool) -> None:
+        queue = self.server.app.reference_candidate_queue
+        if queue is None or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", video_id):
+            self._text(HTTPStatus.NOT_FOUND, "Candidate media was not found.", head=head)
+            return
+        try:
+            item = queue.get(video_id)
+            path_value = item.get("media_path")
+            if not isinstance(path_value, str):
+                raise OSError
+            path = Path(path_value).resolve()
+            media_root = queue.path.parent.resolve()
+            if not path.is_relative_to(media_root):
+                raise OSError
+            if not path.is_file():
+                raise OSError
+            size = path.stat().st_size
+        except (ReferenceDiscoveryError, OSError):
+            self._text(HTTPStatus.NOT_FOUND, "Candidate media was not found.", head=head)
+            return
+        self._send_file(path, size, head=head)
+
+    def _send_file(self, path: Path, size: int, *, head: bool) -> None:
+        start, end, partial = 0, max(0, size - 1), False
+        range_header = self.headers.get("Range")
+        if range_header:
+            try:
+                start, end = parse_range(range_header, size)
+                partial = True
+            except (ValueError, OverflowError):
+                self._headers(
+                    HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, "video/mp4", 0,
+                    extra={"Content-Range": f"bytes */{size}"},
+                )
+                return
+        length = end - start + 1
+        extra = {"Accept-Ranges": "bytes"}
+        if partial:
+            extra["Content-Range"] = f"bytes {start}-{end}/{size}"
+        self._headers(
+            HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK,
+            "video/mp4", length, cache=False, extra=extra,
+        )
+        if not head:
+            with path.open("rb") as stream:
+                stream.seek(start)
+                remaining = length
+                while remaining:
+                    chunk = stream.read(min(CHUNK_SIZE, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
 
     def _media(self, review_id: str, *, head: bool) -> None:
         item = self.server.app.queue.find_by_review_id(review_id)
@@ -535,6 +704,7 @@ textarea{{width:100%;min-height:5rem}}fieldset{{margin:.8rem 0;padding:.8rem}}la
 @media(max-width:700px){{.card{{grid-template-columns:1fr}}.timing-grid{{grid-template-columns:1fr}}}}
 </style></head><body>
 <header><h1>CreatorFlow interactive local review</h1>
+<p><a href="/reference-candidates">Review discovered reference candidates</a></p>
 <p>Queue updated: {_e(updated_at)}</p>
 <form method="get" action="/"><label>Status <select name="status"><option value="">All</option>
 <option>pending</option><option>approved</option><option>rejected</option></select></label>
@@ -542,6 +712,75 @@ textarea{{width:100%;min-height:5rem}}fieldset{{margin:.8rem 0;padding:.8rem}}la
 {banner}{empty}{''.join(sections)}
 </body></html>
 """
+
+
+def render_reference_candidates(
+    items: list[dict[str, Any]], token: str, *,
+    notice: str | None = None, notice_error: bool = False,
+) -> str:
+    banner = (
+        f'<p class="notice {"error" if notice_error else "success"}">{_e(notice)}</p>'
+        if notice else ""
+    )
+    cards = []
+    hidden = f'<input type="hidden" name="form_token" value="{_e(token)}">'
+    for item in sorted(items, key=lambda value: (value.get("rank", 999), value["video_id"])):
+        video_id = quote(item["video_id"], safe="")
+        media = (
+            f'<video controls preload="metadata" src="/reference-media/{video_id}"></video>'
+            if item.get("media_path") else
+            '<p>No retained local preview. Use the source link for review.</p>'
+        )
+        ranking = item.get("ranking") or {}
+        evidence = ranking.get("evidence") or "Ranking evidence unavailable."
+        cards.append(
+            f"""<article class="card"><div>{media}</div><div>
+<h2>Rank {_e(item.get('rank'))}: {_e(item.get('title'))}</h2>
+<p><strong>Status:</strong> {_e(item.get('status'))}<br>
+<strong>Creator:</strong> {_e(item.get('creator'))}<br>
+<strong>Published:</strong> {_e(item.get('published_at'))}<br>
+<strong>Captured:</strong> {_e(item.get('captured_at'))}<br>
+<strong>Views:</strong> {_e(item.get('view_count'))} ·
+<strong>Likes:</strong> {_e(item.get('like_count'))} ·
+<strong>Comments:</strong> {_e(item.get('comment_count'))}<br>
+<strong>Topic:</strong> {_e(item.get('topic'))} ·
+<strong>Query:</strong> {_e(item.get('discovery_query'))}<br>
+<strong>Score:</strong> {_e(item.get('score'))}</p>
+<p><strong>Why it ranked:</strong> {_e(evidence)}</p>
+<p><strong>Media:</strong> {_e(item.get('verified_duration'))}s,
+{_e(item.get('width'))}×{_e(item.get('height'))},
+{_e(item.get('frame_rate'))} fps · video={_e(item.get('has_video'))} ·
+audio={_e(item.get('has_audio'))}</p>
+<p><strong>Transcript/structure:</strong> {_e(item.get('analysis_summary') or 'Unavailable until accepted analysis')}</p>
+<p><a href="{_e(item.get('source_url'))}" rel="noreferrer">Open public source</a></p>
+<form method="post" action="/reference-candidates/{video_id}/decision">
+{hidden}<label>Reference category
+<input name="category" value="{_e(item.get('category') or 'gaming_highlight')}"></label>
+<label>Notes<textarea name="note" maxlength="{MAX_NOTE}">{_e(item.get('notes') or '')}</textarea></label>
+<button name="action" value="accept">Accept as reference</button>
+<button name="action" value="reject">Reject</button>
+<button name="action" value="duplicate">Mark duplicate</button>
+<button name="action" value="discovered">Leave pending</button>
+</form></div></article>"""
+        )
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CreatorFlow reference candidates</title>
+<style>body{{font:16px system-ui;max-width:1200px;margin:auto;padding:1rem}}
+.card{{display:grid;grid-template-columns:minmax(240px,360px) 1fr;gap:1rem;
+border:1px solid #ccc;padding:1rem;margin:1rem 0}}video{{width:100%;aspect-ratio:9/16;
+background:#111}}textarea{{display:block;width:100%;min-height:5rem}}
+label{{display:block;margin:.6rem 0}}button{{padding:.5rem;margin:.2rem}}
+.notice{{border:2px solid;padding:.7rem}}.error{{border-color:#b00}}
+@media(max-width:700px){{.card{{grid-template-columns:1fr}}}}</style></head>
+<body><header><h1>Discovered gaming reference candidates</h1>
+<p><a href="/">Return to generated clip reviews</a></p>
+<p>Discovery scores are transparent heuristics, not measurements of humor,
+quality, or virality. Nothing here influences profiles until a human accepts it.</p>
+<form method="get"><label>Status <select name="status"><option value="">All</option>
+<option>discovered</option><option>accepted</option><option>rejected</option>
+<option>duplicate</option></select></label><button>Filter</button></form></header>
+{banner}{''.join(cards) or '<p>No reference candidates match.</p>'}</body></html>"""
 
 
 def _card(
@@ -680,9 +919,13 @@ def create_application(args: argparse.Namespace) -> ReviewApplication:
     comparator = ReferenceClipComparator(
         ReferenceProfileBuilder(ReferenceClipLibrary())
     )
+    candidate_queue = ReferenceCandidateQueue()
+    discovery_service = ReferenceDiscoveryService(
+        YouTubeDataAPI(), candidate_queue
+    )
     return ReviewApplication(
         queue, service, secrets.token_urlsafe(32), args.maximum_render_duration,
-        comparator, args.reference_profile,
+        comparator, args.reference_profile, candidate_queue, discovery_service,
     )
 
 
