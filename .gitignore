@@ -24,6 +24,8 @@ data/clips/
 data/review/
 data/logs/
 data/database/
+data/manifests/*.json
+data/manifests/.*.tmp
 
 # Temporary files
 *.tmp
