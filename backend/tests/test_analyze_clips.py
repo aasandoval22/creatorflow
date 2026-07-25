@@ -84,6 +84,7 @@ def test_cli_score_breakdown_is_opt_in(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "Components:" in output
     assert "Ending classification:" in output
+    assert "Boundaries:" in output
     assert "Component rounding tolerance: 0.1" in output
     assert "Positive reasons:" in output
     assert "Penalties:" in output

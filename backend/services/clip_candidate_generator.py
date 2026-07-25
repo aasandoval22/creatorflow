@@ -88,6 +88,13 @@ CONTINUATION_OPENERS = (
     "range ",
     "grenade ",
     "that's fine",
+    "to the next level",
+    "guns and then",
+    "just the usual",
+    "made last year",
+    "does not consume",
+    "range to work with",
+    "this build is that",
 )
 INCOMPLETE_ENDINGS = (
     "and",
@@ -101,7 +108,15 @@ INCOMPLETE_ENDINGS = (
     "when",
     "while",
     "to",
+    "on",
+    "of",
+    "in",
+    "from",
+    "into",
+    "about",
+    "depending on",
     "with",
+    "in fact",
     "for example",
     "the reason is",
     "here's why",
@@ -111,6 +126,14 @@ CONCRETE_TERMS = {
     "build", "setup", "cooldown", "damage", "weapon", "armor", "grenade",
     "range", "banner", "mechanic", "perk", "skill", "seconds", "percent",
 }
+MEANINGFUL_PAUSE_SECONDS = 0.65
+INVALID_ENDING_PATTERNS = (
+    r"\bi['’]?m running$",
+    r"\bbecause you should be grappling$",
+    r"\bthe higher the difficulty\b.*\byou(?:'re| are) in$",
+    r"\btwo[- ]piece crodas$",
+    r"\bput on some good$",
+)
 
 
 class TranscriptError(ValueError):
@@ -137,6 +160,17 @@ class EndingAssessment:
     classification: EndingClassification
     score: float
     reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WordEntry:
+    text: str
+    normalized_text: str
+    start: float
+    end: float
+    source_segment_id: int | str
+    source_segment_index: int
+    word_index: int
 
 
 @dataclass(frozen=True)
@@ -173,6 +207,10 @@ class CandidateConfiguration:
     minimum_word_count: int = 35
     maximum_overlap: float = 0.5
     maximum_candidates: int = 10
+    padding_before_seconds: float = 0.15
+    padding_after_seconds: float = 0.25
+    minimum_boundary_confidence: float = 0.55
+    meaningful_pause_seconds: float = MEANINGFUL_PAUSE_SECONDS
 
     def __post_init__(self) -> None:
         if not (
@@ -187,6 +225,12 @@ class CandidateConfiguration:
             raise ValueError("Word count and maximum candidates must be positive.")
         if not 0 <= self.maximum_overlap <= 1:
             raise ValueError("Maximum overlap must be between 0 and 1.")
+        if self.padding_before_seconds < 0 or self.padding_after_seconds < 0:
+            raise ValueError("Media padding cannot be negative.")
+        if not 0 <= self.minimum_boundary_confidence <= 1:
+            raise ValueError("Minimum boundary confidence must be between 0 and 1.")
+        if self.meaningful_pause_seconds < 0:
+            raise ValueError("Meaningful pause cannot be negative.")
 
 
 class ClipCandidateGenerator:
@@ -276,7 +320,10 @@ class ClipCandidateGenerator:
             )
             transcript = self.load_transcript(transcript_path, video_id)
             candidates = self.generate_candidates(
-                video_id, transcript["segments"]
+                video_id,
+                transcript["segments"],
+                media_duration=transcript.get("duration_seconds")
+                or record.get("duration_seconds"),
             )
             artifact_path = self._write_artifact(
                 record, transcript_path, candidates
@@ -350,15 +397,416 @@ class ClipCandidateGenerator:
                 segment_id = index
             if isinstance(segment_id, bool) or not isinstance(segment_id, (int, str)):
                 raise TranscriptError(f"Transcript segment {index} has an invalid id.")
-            normalized.append(
-                {"id": segment_id, "start": float(start), "end": float(end), "text": text.strip()}
-            )
+            normalized_segment = {
+                "id": segment_id,
+                "start": float(start),
+                "end": float(end),
+                "text": text.strip(),
+            }
+            if isinstance(segment.get("words"), list):
+                normalized_segment["words"] = segment["words"]
+            normalized.append(normalized_segment)
         for previous, current in zip(normalized, normalized[1:]):
             if current["start"] < previous["start"]:
                 raise TranscriptError("Transcript segments must be timestamp ordered.")
         return {**document, "segments": normalized}
 
     def generate_candidates(
+        self,
+        video_id: str,
+        segments: list[dict[str, Any]],
+        *,
+        media_duration: float | None = None,
+    ) -> list[dict[str, Any]]:
+        timeline = self.build_word_timeline(segments)
+        if timeline:
+            return self._generate_word_candidates(
+                video_id, timeline, media_duration=media_duration
+            )
+        return self._generate_segment_candidates(video_id, segments)
+
+    @staticmethod
+    def build_word_timeline(
+        segments: list[dict[str, Any]],
+    ) -> list[WordEntry]:
+        """Return valid, chronological Whisper words or an empty fallback signal.
+
+        Malformed, untimed, or nonchronological word records are ignored. If a
+        segment has no usable timed words, an empty list explicitly signals the
+        caller to use segment-boundary generation instead of bridging unknown
+        speech.
+        """
+        timeline: list[WordEntry] = []
+        for segment_index, segment in enumerate(segments):
+            raw_words = segment.get("words")
+            if not isinstance(raw_words, list) or not raw_words:
+                return []
+            segment_words: list[WordEntry] = []
+            for word_index, raw_word in enumerate(raw_words):
+                if not isinstance(raw_word, dict):
+                    continue
+                text = raw_word.get("word")
+                start, end = raw_word.get("start"), raw_word.get("end")
+                if (
+                    not isinstance(text, str)
+                    or not text.strip()
+                    or isinstance(start, bool)
+                    or isinstance(end, bool)
+                    or not isinstance(start, (int, float))
+                    or not isinstance(end, (int, float))
+                    or start < 0
+                    or end <= start
+                    or start < segment["start"] - 0.5
+                    or end > segment["end"] + 0.5
+                ):
+                    continue
+                normalized_text = " ".join(WORD_RE.findall(text.lower()))
+                if not normalized_text:
+                    continue
+                entry = WordEntry(
+                    text=text,
+                    normalized_text=normalized_text,
+                    start=float(start),
+                    end=float(end),
+                    source_segment_id=segment["id"],
+                    source_segment_index=segment_index,
+                    word_index=word_index,
+                )
+                if segment_words and entry.start < segment_words[-1].end - 0.05:
+                    continue
+                if timeline and entry.start < timeline[-1].end - 0.05:
+                    continue
+                segment_words.append(entry)
+            if not segment_words:
+                return []
+            timeline.extend(segment_words)
+        return timeline
+
+    def _generate_word_candidates(
+        self,
+        video_id: str,
+        words: list[WordEntry],
+        *,
+        media_duration: float | None,
+    ) -> list[dict[str, Any]]:
+        config = self.configuration
+        raw: list[dict[str, Any]] = []
+        for start_index in range(len(words)):
+            start_details, start_reasons = self._assess_word_start(words, start_index)
+            if start_details["confidence"] < config.minimum_boundary_confidence:
+                continue
+            choices: list[dict[str, Any]] = []
+            for end_index in range(start_index, len(words)):
+                content_duration = words[end_index].end - words[start_index].start
+                if content_duration > config.maximum_duration_seconds:
+                    break
+                if (
+                    content_duration < config.minimum_duration_seconds
+                    or end_index - start_index + 1 < config.minimum_word_count
+                ):
+                    continue
+                ending, end_details = self._assess_word_end(words, end_index)
+                if end_details["confidence"] < config.minimum_boundary_confidence:
+                    continue
+                choices.append(
+                    self._make_word_candidate(
+                        video_id,
+                        words,
+                        start_index,
+                        end_index,
+                        start_details,
+                        end_details,
+                        start_reasons,
+                        ending,
+                        media_duration=media_duration,
+                    )
+                )
+            if choices:
+                # Completeness outranks hitting the target exactly.
+                choices.sort(
+                    key=lambda candidate: (
+                        -min(
+                            candidate["boundary_details"]["start_confidence"],
+                            candidate["boundary_details"]["end_confidence"],
+                        ),
+                        -candidate["boundary_details"]["end_confidence"],
+                        -candidate["component_scores"]["structure_score"],
+                        -candidate["score"],
+                        abs(
+                            candidate["duration"]
+                            - config.target_duration_seconds
+                        ),
+                        candidate["end"],
+                    )
+                )
+                raw.append(choices[0])
+        return self._filter_and_rank(raw)
+
+    def _make_word_candidate(
+        self,
+        video_id: str,
+        words: list[WordEntry],
+        start_index: int,
+        end_index: int,
+        start_details: dict[str, Any],
+        end_details: dict[str, Any],
+        start_reasons: list[str],
+        ending: EndingAssessment,
+        *,
+        media_duration: float | None,
+    ) -> dict[str, Any]:
+        selected = words[start_index : end_index + 1]
+        text = self._join_word_text(selected)
+        content_start, content_end = selected[0].start, selected[-1].end
+        upper_bound = (
+            float(media_duration)
+            if isinstance(media_duration, (int, float))
+            and not isinstance(media_duration, bool)
+            and media_duration > 0
+            else words[-1].end
+        )
+        start = max(0.0, content_start - self.configuration.padding_before_seconds)
+        end = min(upper_bound, content_end + self.configuration.padding_after_seconds)
+        components, reasons = self.score_candidate(
+            text,
+            content_end - content_start,
+            target_duration=self.configuration.target_duration_seconds,
+        )
+        start_confidence = start_details["confidence"]
+        end_confidence = end_details["confidence"]
+        components["start_boundary_score"] = 18.0 * start_confidence
+        components["end_boundary_score"] = 18.0 * end_confidence
+        components["boundary_penalty_score"] = -24.0 * (
+            1.0 - min(start_confidence, end_confidence)
+        )
+        reasons = (
+            start_reasons
+            + reasons
+            + list(ending.reasons)
+            + [
+                f"Boundary decision: {start_details['method']} start and "
+                f"{end_details['method']} ending"
+            ]
+        )
+        serialized_components = {
+            name: round(value, 1) for name, value in components.items()
+        }
+        total = round(sum(serialized_components.values()), 1)
+        if total > 100:
+            serialized_components["score_cap_adjustment"] = round(100 - total, 1)
+        elif total < 0:
+            serialized_components["score_floor_adjustment"] = round(-total, 1)
+        segment_ids = list(dict.fromkeys(word.source_segment_id for word in selected))
+        identity = f"{video_id}:{content_start:.3f}:{content_end:.3f}".encode()
+        return {
+            "rank": 0,
+            "candidate_id": f"{video_id}-{hashlib.sha256(identity).hexdigest()[:12]}",
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(end - start, 3),
+            "text": text,
+            "score": round(sum(serialized_components.values()), 1),
+            "reasons": reasons,
+            "ending_classification": ending.classification.value,
+            "boundary_details": {
+                "start_method": start_details["method"],
+                "end_method": end_details["method"],
+                "start_confidence": round(start_confidence, 2),
+                "end_confidence": round(end_confidence, 2),
+            },
+            "component_scores": serialized_components,
+            "segment_ids": segment_ids,
+        }
+
+    @staticmethod
+    def _join_word_text(words: list[WordEntry]) -> str:
+        if any(word.text[:1].isspace() for word in words):
+            return "".join(word.text for word in words).strip()
+        return " ".join(word.text.strip() for word in words).strip()
+
+    def _assess_word_start(
+        self, words: list[WordEntry], index: int
+    ) -> tuple[dict[str, Any], list[str]]:
+        word = words[index]
+        previous = words[index - 1] if index else None
+        opening = " ".join(item.normalized_text for item in words[index : index + 7])
+        prior_words = " ".join(
+            item.normalized_text for item in words[max(0, index - 4) : index]
+        )
+        invalid = opening.startswith(CONTINUATION_OPENERS) or (
+            opening.startswith(("how much ", "how many "))
+            and previous is not None
+            and not previous.text.rstrip().endswith((".", "!", "?"))
+            and word.start - previous.end
+            < self.configuration.meaningful_pause_seconds
+        )
+        if prior_words.endswith(
+            ("because", "and", "but", "or", "so", "that", "which", "where")
+        ):
+            invalid = True
+        prior_punctuation = bool(
+            previous and previous.text.rstrip().endswith((".", "!", "?"))
+        )
+        pause = bool(
+            previous
+            and word.start - previous.end
+            >= self.configuration.meaningful_pause_seconds
+        )
+        opener = opening.startswith(SELF_CONTAINED_OPENERS)
+        clear_subject = bool(
+            re.match(
+                r"(?:the|this|that|these|those|my|your)\s+[\w']+\s+"
+                r"(?:is|are|has|have|uses|gives|does|can|will)\b",
+                opening,
+            )
+        )
+        reasons: list[str] = []
+        if invalid:
+            return (
+                {"method": "invalid_continuation", "confidence": 0.1},
+                ["Penalized because the opening plainly continues an earlier thought"],
+            )
+        signals: list[str] = []
+        confidence = 0.35
+        if previous is None:
+            confidence = 0.9
+            signals.append("transcript_start")
+            reasons.append("Begins at the start of the transcript")
+        if prior_punctuation:
+            confidence += 0.32
+            signals.append("sentence_boundary")
+            reasons.append("Begins after sentence punctuation")
+        if pause:
+            confidence += 0.3
+            signals.append("pause")
+            reasons.append("Begins after a meaningful pause")
+        if opener:
+            confidence += 0.3
+            signals.append("topic_opener")
+            reasons.append("Uses a self-contained opening")
+        if clear_subject:
+            confidence += 0.18
+            signals.append("clear_subject")
+            reasons.append("Introduces a clear subject")
+        first = word.normalized_text
+        if first in {"and", "but", "or", "so", "because", "which", "it", "they", "he", "she"}:
+            confidence -= 0.35
+            reasons.append("Penalized because the opening depends on prior context")
+        method = "_and_".join(signals) if signals else "weak_grammatical_start"
+        return {"method": method, "confidence": max(0.0, min(1.0, confidence))}, reasons
+
+    def _assess_word_end(
+        self, words: list[WordEntry], index: int
+    ) -> tuple[EndingAssessment, dict[str, Any]]:
+        selected_tail = self._join_word_text(words[max(0, index - 11) : index + 1])
+        following = self._join_word_text(words[index + 1 : index + 7]).lower()
+        current = words[index]
+        next_word = words[index + 1] if index + 1 < len(words) else None
+        pause = bool(
+            next_word
+            and next_word.start - current.end
+            >= self.configuration.meaningful_pause_seconds
+        )
+        punctuated = current.text.rstrip().endswith((".", "!", "?"))
+        ending = self._assess_end({"text": selected_tail})
+        semantic_tail = selected_tail.lower().rstrip(" .!?,;:")
+        explicit_invalid = any(
+            re.search(pattern, semantic_tail) for pattern in INVALID_ENDING_PATTERNS
+        )
+        setup_continues = (
+            following.startswith(
+                (
+                    "because ",
+                    "that ",
+                    "which ",
+                    "and ",
+                    "but ",
+                    "how much ",
+                    "how many ",
+                )
+            )
+            and not punctuated
+        )
+        if explicit_invalid or setup_continues:
+            ending = EndingAssessment(
+                EndingClassification.INCOMPLETE,
+                0.0,
+                ("Penalized because the ending is visibly unfinished",),
+            )
+        confidence = {
+            EndingClassification.INCOMPLETE: 0.12,
+            EndingClassification.UNCERTAIN: 0.2,
+            EndingClassification.ACCEPTABLE_COMPLETE_WITHOUT_PUNCTUATION: 0.42,
+            EndingClassification.STRONG_COMPLETE: 0.42,
+        }[ending.classification]
+        signals: list[str] = []
+        if punctuated and ending.classification is not EndingClassification.INCOMPLETE:
+            confidence += 0.43
+            signals.append("sentence_punctuation")
+        if pause and ending.classification is not EndingClassification.INCOMPLETE:
+            confidence += 0.28
+            signals.append("pause")
+        if next_word is None and ending.classification is not EndingClassification.INCOMPLETE:
+            confidence += 0.2
+            signals.append("transcript_end")
+        next_topic = (
+            following.startswith(SELF_CONTAINED_OPENERS)
+            and not following.startswith(("how much ", "how many "))
+        )
+        next_subject = bool(
+            re.match(
+                r"(?:the|this|that|these|those|my|your)\s+[\w']+\s+"
+                r"(?:is|are|has|have|uses|gives|does|can|will)\b",
+                following,
+            )
+        )
+        if (
+            ending.classification
+            is EndingClassification.ACCEPTABLE_COMPLETE_WITHOUT_PUNCTUATION
+            and (pause or next_word is None or next_topic or next_subject)
+        ):
+            confidence += 0.2
+            signals.append("complete_clause")
+        if next_topic and ending.classification is not EndingClassification.INCOMPLETE:
+            confidence += 0.18
+            signals.append("next_topic")
+        elif next_subject and ending.classification is not EndingClassification.INCOMPLETE:
+            confidence += 0.12
+            signals.append("next_subject")
+        if ending.classification is EndingClassification.STRONG_COMPLETE:
+            signals.append("complete_clause")
+        method = "_and_".join(signals) if signals else "incomplete_or_uncertain"
+        return ending, {
+            "method": method,
+            "confidence": max(0.0, min(1.0, confidence)),
+        }
+
+    def _filter_and_rank(
+        self, raw: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        raw.sort(key=self._candidate_sort_key)
+        accepted: list[dict[str, Any]] = []
+        for candidate in raw:
+            duplicate = any(
+                self._text_similarity(candidate["text"], existing["text"]) >= 0.72
+                for existing in accepted
+            )
+            overlap = any(
+                self._overlap_fraction(candidate, existing)
+                > self.configuration.maximum_overlap
+                for existing in accepted
+            )
+            if duplicate or overlap:
+                continue
+            accepted.append(candidate)
+            if len(accepted) >= self.configuration.maximum_candidates:
+                break
+        accepted.sort(key=self._final_rank_sort_key)
+        for rank, candidate in enumerate(accepted, 1):
+            candidate["rank"] = rank
+        return accepted
+
+    def _generate_segment_candidates(
         self, video_id: str, segments: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         config = self.configuration
@@ -469,9 +917,33 @@ class ClipCandidateGenerator:
             "score": score,
             "reasons": reasons,
             "ending_classification": ending.classification.value,
+            "boundary_details": {
+                "start_method": self._boundary_method(start_reasons, "segment_start"),
+                "end_method": self._boundary_method(
+                    list(ending.reasons), "segment_end"
+                ),
+                "start_confidence": round(start_score / 18.0, 2),
+                "end_confidence": round(ending.score / 14.0, 2),
+            },
             "component_scores": serialized_components,
             "segment_ids": [s["id"] for s in segments],
         }
+
+    @staticmethod
+    def _boundary_method(reasons: list[str], default: str) -> str:
+        lower = " ".join(reasons).lower()
+        labels = []
+        if "pause" in lower:
+            labels.append("pause")
+        if "punctuation" in lower or "completed sentence" in lower:
+            labels.append("sentence_boundary")
+        if "self-contained" in lower:
+            labels.append("topic_opener")
+        if "complete" in lower:
+            labels.append("complete_clause")
+        if "incomplete" in lower or "continues" in lower:
+            labels.append("invalid_continuation")
+        return "_and_".join(labels) or default
 
     @staticmethod
     def score_candidate(
@@ -646,8 +1118,9 @@ class ClipCandidateGenerator:
         semantic_end = lower.rstrip(" .!?")
         punctuated = text.endswith((".", "!", "?"))
         incomplete = any(
-            semantic_end.endswith(ending) for ending in INCOMPLETE_ENDINGS
-        )
+            semantic_end == ending or semantic_end.endswith(f" {ending}")
+            for ending in INCOMPLETE_ENDINGS
+        ) or any(re.search(pattern, semantic_end) for pattern in INVALID_ENDING_PATTERNS)
         introducing = bool(
             re.search(
                 r"\b(?:first|next|another|the reason is|here's why)[,:]?\s*$",
@@ -692,11 +1165,20 @@ class ClipCandidateGenerator:
     @staticmethod
     def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[float, ...]:
         components = candidate["component_scores"]
+        boundary = candidate.get("boundary_details", {})
+        start_confidence = boundary.get(
+            "start_confidence", components["start_boundary_score"] / 18.0
+        )
+        end_confidence = boundary.get(
+            "end_confidence", components["end_boundary_score"] / 14.0
+        )
         return (
-            -components["start_boundary_score"],
-            -components["end_boundary_score"],
-            -components["duration_fit_score"],
+            -min(start_confidence, end_confidence),
+            -start_confidence,
+            -end_confidence,
+            -components.get("structure_score", 0.0),
             -candidate["score"],
+            -components["duration_fit_score"],
             candidate["start"],
             candidate["end"],
         )
@@ -704,10 +1186,15 @@ class ClipCandidateGenerator:
     @staticmethod
     def _final_rank_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
         components = candidate["component_scores"]
+        boundary = candidate.get("boundary_details", {})
         return (
             -candidate["score"],
-            -components["start_boundary_score"],
-            -components["end_boundary_score"],
+            -boundary.get(
+                "start_confidence", components["start_boundary_score"] / 18.0
+            ),
+            -boundary.get(
+                "end_confidence", components["end_boundary_score"] / 14.0
+            ),
             -components["duration_fit_score"],
             candidate["start"],
             candidate["candidate_id"],
@@ -752,6 +1239,10 @@ class ClipCandidateGenerator:
                 "target_duration_seconds": config.target_duration_seconds,
                 "maximum_duration_seconds": config.maximum_duration_seconds,
                 "maximum_candidates": config.maximum_candidates,
+                "padding_before_seconds": config.padding_before_seconds,
+                "padding_after_seconds": config.padding_after_seconds,
+                "minimum_boundary_confidence": config.minimum_boundary_confidence,
+                "meaningful_pause_seconds": config.meaningful_pause_seconds,
             },
             "candidates": candidates,
         }
