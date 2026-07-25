@@ -153,8 +153,10 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 message = self._decision(review_id, form)
             elif action == "adjust":
                 message = self._adjust(review_id, form)
-            else:
+            elif action == "reset-timing":
                 message = self._reset(review_id, form)
+            else:
+                message = self._reapply_context(review_id, form)
         except RequestError as error:
             self._text(error.status, error.message)
             return
@@ -184,7 +186,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
     def _write_route(path: str) -> tuple[str, str] | None:
         parts = path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "reviews" and parts[2] in {
-            "decision", "adjust", "reset-timing"
+            "decision", "adjust", "reset-timing", "reapply-context"
         }:
             review_id = parts[1]
             if review_id and "/" not in review_id and review_id.startswith("review_"):
@@ -319,6 +321,17 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         return (
             f"Preview reset to candidate timing at revision {result.item['timing_revision']}: "
             f"{result.render_start:.3f}–{result.render_end:.3f}s. It is pending review."
+        )
+
+    def _reapply_context(self, review_id: str, form: dict[str, list[str]]) -> str:
+        note, clear = self._note(form)
+        result = self.server.app.timing_service.reapply_context(
+            review_id, profile="reaction", note=note, clear_note=clear, force=True
+        )
+        return (
+            f"Automatic reaction context reapplied at revision "
+            f"{result.item['timing_revision']}: {result.render_start:.3f}–"
+            f"{result.render_end:.3f}s. It is pending review."
         )
 
     def _redirect(self, kind: str, message: str) -> None:
@@ -508,7 +521,11 @@ def _card(item: dict[str, Any], token: str, maximum_duration: float) -> str:
 <strong>Lead-in:</strong> {_e(item['lead_in_seconds'])}s · <strong>Tail:</strong> {_e(item['tail_seconds'])}s<br>
 <strong>Timing revision:</strong> {_e(item['timing_revision'])} ·
 <strong>Timing updated:</strong> {_e(item['timing_updated_at'])}<br>
-<strong>Timing-adjusted:</strong> {'Yes' if adjusted else 'No'}<br>
+<strong>Timing source:</strong> {_e(item['timing_source'])} ·
+<strong>Context profile:</strong> {_e(item['context_profile'])}<br>
+<strong>Expansion reasons:</strong> {_e('; '.join(item['context_reasons']) or '—')}<br>
+<strong>Timing-adjusted:</strong> {'Yes' if adjusted else 'No'} ·
+<strong>Later manually adjusted:</strong> {'Yes' if item['timing_source'] == 'manual' else 'No'}<br>
 <strong>Preview metadata path:</strong> {_e(item['preview_metadata_path'])}</p>{pending_adjusted}
 <form method="post" action="/reviews/{review_id}/decision"><fieldset><legend>Review decision</legend>{hidden}
 <label>Review note (maximum {MAX_NOTE} characters)
@@ -531,6 +548,10 @@ Use either relative or absolute fields, not both.</p><div class="timing-grid">
 <form method="post" action="/reviews/{review_id}/reset-timing"><fieldset><legend>Reset timing</legend>{hidden}
 <p class="danger">This rerenders and replaces the preview using the original candidate range.</p>
 <button type="submit">Reset to candidate timing</button></fieldset></form>
+<form method="post" action="/reviews/{review_id}/reapply-context"><fieldset>
+<legend>Automatic context</legend>{hidden}
+<p>Rerenders synchronously using the reaction profile and returns this item to pending.</p>
+<button type="submit">Reapply Automatic Context</button></fieldset></form>
 </div></article>"""
 
 

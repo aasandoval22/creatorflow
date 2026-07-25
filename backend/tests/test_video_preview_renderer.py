@@ -317,7 +317,7 @@ def test_adjusted_render_uses_window_captions_and_v2_metadata(preview_files):
     assert ffmpeg[ffmpeg.index("-ss") + 1] == "0.000"
     assert ffmpeg[ffmpeg.index("-t") + 1] == "4.000"
     metadata = json.loads(Path(result.metadata_path).read_text())
-    assert metadata["version"] == 2
+    assert metadata["version"] == 3
     assert metadata["candidate_start"] == 1
     assert metadata["render_start"] == 0
     assert metadata["render_end"] == 4

@@ -24,7 +24,7 @@ from backend.services.video_manifest import utc_now
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REVIEW_QUEUE_PATH = PROJECT_ROOT / "data" / "review_queue" / "reviews.json"
-REVIEW_QUEUE_VERSION = 2
+REVIEW_QUEUE_VERSION = 3
 REVIEW_STATUSES = frozenset({"pending", "approved", "rejected"})
 ITEM_FIELDS = {
     "review_id", "video_id", "candidate_id", "candidate_rank",
@@ -34,6 +34,7 @@ ITEM_FIELDS = {
     "created_at", "updated_at",
     "render_start", "render_end", "render_duration", "lead_in_seconds",
     "tail_seconds", "timing_revision", "timing_updated_at",
+    "timing_source", "context_profile", "context_reasons",
 }
 
 
@@ -84,8 +85,8 @@ class ClipReviewQueue:
         with self.locked():
             if self.path.exists():
                 document = self._read_document()
-                if document.get("version") == 1:
-                    document = self._migrate_v1(document)
+                if document.get("version") in (1, 2):
+                    document = self._migrate_legacy(document)
                     self._write_document(document)
                 self._validate_document(document)
 
@@ -116,24 +117,28 @@ class ClipReviewQueue:
                 else:
                     depths[key] = depth
 
-    def _migrate_v1(self, document: dict[str, Any]) -> dict[str, Any]:
+    def _migrate_legacy(self, document: dict[str, Any]) -> dict[str, Any]:
         if set(document) != {"version", "updated_at", "items"} or not isinstance(
             document.get("items"), list
         ):
-            raise ReviewQueueError("Version 1 review queue has an invalid structure.")
+            raise ReviewQueueError("Legacy review queue has an invalid structure.")
         migrated = copy.deepcopy(document)
+        source_version = migrated["version"]
         migrated["version"] = REVIEW_QUEUE_VERSION
         for item in migrated["items"]:
             if not isinstance(item, dict):
                 raise ReviewQueueError("Version 1 review queue contains an invalid item.")
+            if source_version == 1:
+                item.update(
+                    render_start=item.get("candidate_start"),
+                    render_end=item.get("candidate_end"),
+                    render_duration=item.get("candidate_duration"),
+                    lead_in_seconds=0.0, tail_seconds=0.0,
+                    timing_revision=0, timing_updated_at=None,
+                )
             item.update(
-                render_start=item.get("candidate_start"),
-                render_end=item.get("candidate_end"),
-                render_duration=item.get("candidate_duration"),
-                lead_in_seconds=0.0,
-                tail_seconds=0.0,
-                timing_revision=0,
-                timing_updated_at=None,
+                timing_source="manual" if item.get("timing_revision", 0) else "candidate",
+                context_profile=None, context_reasons=[],
             )
         self._validate_document(migrated)
         return migrated
@@ -227,6 +232,16 @@ class ClipReviewQueue:
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             raise ReviewQueueError(f"{label} timing_revision must be a nonnegative integer.")
         _timestamp(item["timing_updated_at"], f"{label} timing_updated_at", nullable=True)
+        if item["timing_source"] not in {"candidate", "automatic", "manual"}:
+            raise ReviewQueueError(f"{label} timing_source is invalid.")
+        if item["context_profile"] is not None and (
+            not isinstance(item["context_profile"], str) or not item["context_profile"].strip()
+        ):
+            raise ReviewQueueError(f"{label} context_profile must be a string or null.")
+        if not isinstance(item["context_reasons"], list) or any(
+            not isinstance(reason, str) or not reason.strip() for reason in item["context_reasons"]
+        ):
+            raise ReviewQueueError(f"{label} context_reasons must be a list of strings.")
         status = item["status"]
         if status not in REVIEW_STATUSES:
             raise ReviewQueueError(f"{label} status must be pending, approved, or rejected.")
@@ -286,15 +301,24 @@ class ClipReviewQueue:
     def add_or_update_preview(
         self, video_id: str, candidate: dict[str, Any],
         preview_path: str | Path, preview_metadata_path: str | Path,
+        *, render_start: float | None = None, render_end: float | None = None,
+        timing_source: str = "candidate", context_profile: str | None = None,
+        context_reasons: list[str] | tuple[str, ...] = (),
     ) -> dict[str, Any]:
         with self.locked():
             return self._add_or_update_preview(
-                video_id, candidate, preview_path, preview_metadata_path
+                video_id, candidate, preview_path, preview_metadata_path,
+                render_start=render_start, render_end=render_end,
+                timing_source=timing_source, context_profile=context_profile,
+                context_reasons=context_reasons,
             )
 
     def _add_or_update_preview(
         self, video_id: str, candidate: dict[str, Any],
         preview_path: str | Path, preview_metadata_path: str | Path,
+        *, render_start: float | None = None, render_end: float | None = None,
+        timing_source: str = "candidate", context_profile: str | None = None,
+        context_reasons: list[str] | tuple[str, ...] = (),
     ) -> dict[str, Any]:
         document = self._load()
         now = utc_now()
@@ -309,24 +333,36 @@ class ClipReviewQueue:
             if (item["video_id"], item["candidate_id"]) == identity
         ), None)
         preserved = existing or {}
-        preserve_candidate = bool(existing and existing.get("timing_revision", 0) > 0)
+        preserve_candidate = bool(existing and existing.get("timing_source") == "manual")
+        preserve_timing = bool(existing and existing.get("timing_source") == "manual")
+        chosen_start = preserved.get("render_start") if preserve_timing else (
+            candidate.get("start") if render_start is None else render_start
+        )
+        chosen_end = preserved.get("render_end") if preserve_timing else (
+            candidate.get("end") if render_end is None else render_end
+        )
+        candidate_start = preserved["candidate_start"] if preserve_candidate else candidate.get("start")
+        candidate_end = preserved["candidate_end"] if preserve_candidate else candidate.get("end")
         item = {
             "review_id": self.stable_review_id(*identity),
             "video_id": video_id,
             "candidate_id": candidate_id,
             "candidate_rank": preserved["candidate_rank"] if preserve_candidate else candidate.get("rank"),
             "candidate_score": preserved["candidate_score"] if preserve_candidate else candidate.get("score"),
-            "candidate_start": preserved["candidate_start"] if preserve_candidate else candidate.get("start"),
-            "candidate_end": preserved["candidate_end"] if preserve_candidate else candidate.get("end"),
+            "candidate_start": candidate_start,
+            "candidate_end": candidate_end,
             "candidate_duration": preserved["candidate_duration"] if preserve_candidate else candidate.get("duration"),
             "candidate_text": preserved["candidate_text"] if preserve_candidate else candidate.get("text"),
-            "render_start": preserved["render_start"] if preserve_candidate else candidate.get("start"),
-            "render_end": preserved["render_end"] if preserve_candidate else candidate.get("end"),
-            "render_duration": preserved["render_duration"] if preserve_candidate else candidate.get("duration"),
-            "lead_in_seconds": preserved["lead_in_seconds"] if preserve_candidate else 0.0,
-            "tail_seconds": preserved["tail_seconds"] if preserve_candidate else 0.0,
+            "render_start": chosen_start,
+            "render_end": chosen_end,
+            "render_duration": chosen_end - chosen_start,
+            "lead_in_seconds": candidate_start - chosen_start,
+            "tail_seconds": chosen_end - candidate_end,
             "timing_revision": preserved.get("timing_revision", 0),
             "timing_updated_at": preserved.get("timing_updated_at"),
+            "timing_source": preserved.get("timing_source") if preserve_timing else timing_source,
+            "context_profile": preserved.get("context_profile") if preserve_timing else context_profile,
+            "context_reasons": preserved.get("context_reasons") if preserve_timing else list(context_reasons),
             "preview_path": str(preview_path),
             "preview_metadata_path": str(preview_metadata_path),
             "status": preserved.get("status", "pending"),
@@ -348,18 +384,24 @@ class ClipReviewQueue:
         self, review_id: str, *, render_start: float, render_end: float,
         preview_path: str | Path, preview_metadata_path: str | Path,
         note: str | None = None, clear_note: bool = False,
+        timing_source: str = "manual", context_profile: str | None = None,
+        context_reasons: list[str] | tuple[str, ...] = (),
     ) -> dict[str, Any]:
         with self.locked():
             return self._update_timing(
                 review_id, render_start=render_start, render_end=render_end,
                 preview_path=preview_path, preview_metadata_path=preview_metadata_path,
                 note=note, clear_note=clear_note,
+                timing_source=timing_source, context_profile=context_profile,
+                context_reasons=context_reasons,
             )
 
     def _update_timing(
         self, review_id: str, *, render_start: float, render_end: float,
         preview_path: str | Path, preview_metadata_path: str | Path,
         note: str | None = None, clear_note: bool = False,
+        timing_source: str = "manual", context_profile: str | None = None,
+        context_reasons: list[str] | tuple[str, ...] = (),
     ) -> dict[str, Any]:
         if note is not None and clear_note:
             raise ReviewQueueError("A note and clear_note cannot be used together.")
@@ -377,6 +419,8 @@ class ClipReviewQueue:
             tail_seconds=round(end - item["candidate_end"], 3),
             timing_revision=item["timing_revision"] + 1,
             timing_updated_at=now,
+            timing_source=timing_source, context_profile=context_profile,
+            context_reasons=list(context_reasons),
             preview_path=str(preview_path),
             preview_metadata_path=str(preview_metadata_path),
             status="pending", reviewed_at=None, updated_at=now,
