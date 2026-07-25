@@ -37,6 +37,17 @@ class DownloadResult:
     downloaded_count: int = 0
 
 
+@dataclass(frozen=True)
+class ChannelDiscoveryResult:
+    """Read-only recent-video discovery result."""
+
+    status: DownloadStatus
+    channel_name: str
+    channel_url: str
+    entries: tuple[dict[str, Any], ...]
+    message: str
+
+
 class YouTubeDownloader:
     """Discover and download YouTube videos with structured tracking."""
 
@@ -46,13 +57,19 @@ class YouTubeDownloader:
         archive_directory: Path = ARCHIVE_DIRECTORY,
         manifest_path: Path = DEFAULT_MANIFEST_PATH,
         manifest: VideoManifest | None = None,
+        *,
+        discovery_only: bool = False,
     ) -> None:
         self.download_directory = Path(download_directory)
         self.archive_directory = Path(archive_directory)
         self.download_archive = self.archive_directory / DOWNLOAD_ARCHIVE.name
-        self.download_directory.mkdir(parents=True, exist_ok=True)
-        self.archive_directory.mkdir(parents=True, exist_ok=True)
-        self.manifest = manifest or VideoManifest(manifest_path)
+        self.discovery_only = discovery_only
+        if not discovery_only:
+            self.download_directory.mkdir(parents=True, exist_ok=True)
+            self.archive_directory.mkdir(parents=True, exist_ok=True)
+        self.manifest = manifest or (
+            None if discovery_only else VideoManifest(manifest_path)
+        )
 
     def _build_options(self) -> dict[str, Any]:
         """Return the shared yt-dlp download configuration."""
@@ -127,6 +144,51 @@ class YouTubeDownloader:
             channel_name,
             normalized_url,
             download=False,
+        )
+
+    def discover_recent_channel_metadata(
+        self,
+        channel_name: str,
+        channel_url: str,
+        max_videos: int = 3,
+    ) -> ChannelDiscoveryResult:
+        """Return recent metadata without changing manifests or downloading."""
+
+        videos_url, normalized_url = self._channel_urls(channel_url, max_videos)
+        metadata_result = self._extract_metadata(videos_url, max_videos)
+        if isinstance(metadata_result, DownloadResult):
+            return ChannelDiscoveryResult(
+                DownloadStatus.FAILED, channel_name, normalized_url, (),
+                metadata_result.message,
+            )
+        entries = tuple(self._entries_from_metadata(metadata_result))
+        if not entries:
+            return ChannelDiscoveryResult(
+                DownloadStatus.FAILED, channel_name, normalized_url, (),
+                "Metadata collection failed: no video entries were returned.",
+            )
+        return ChannelDiscoveryResult(
+            DownloadStatus.SUCCESS, channel_name, normalized_url, entries,
+            f"Discovered {len(entries)} recent video(s).",
+        )
+
+    def download_discovered_entry(
+        self,
+        metadata: dict[str, Any],
+        channel_name: str,
+        channel_url: str,
+    ) -> DownloadResult:
+        """Download one previously discovered metadata entry."""
+
+        video_id = metadata.get("id")
+        result_url = (
+            metadata.get("webpage_url")
+            if isinstance(metadata.get("webpage_url"), str)
+            else f"https://www.youtube.com/watch?v={video_id}"
+        )
+        normalized_url = normalize_youtube_channel_url(channel_url)
+        return self._process_entries(
+            [metadata], result_url, channel_name, normalized_url, download=True
         )
 
     def download_recent_channel_videos(
@@ -230,6 +292,10 @@ class YouTubeDownloader:
         channel_url: str | None,
         download: bool,
     ) -> DownloadResult:
+        if self.manifest is None:
+            raise RuntimeError(
+                "This downloader was initialized for read-only discovery."
+            )
         if not entries:
             return DownloadResult(
                 DownloadStatus.FAILED,

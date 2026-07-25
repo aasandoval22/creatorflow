@@ -3,7 +3,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from backend.services.video_manifest import VideoStatus
-from backend.services.youtube_downloader import DownloadStatus, YouTubeDownloader
+from backend.services.youtube_downloader import (
+    DownloadResult, DownloadStatus, YouTubeDownloader,
+)
 
 
 VIDEO_URL = "https://www.youtube.com/watch?v=abc"
@@ -109,6 +111,47 @@ def test_collects_metadata_before_download_and_records_discovered(downloader):
     )
     assert events[0] == ("manifest", VideoStatus.DISCOVERED.value)
     assert events[1] == ("download", None)
+
+
+def test_read_only_metadata_discovery_does_not_create_storage_or_manifest(tmp_path):
+    downloads = tmp_path / "downloads"
+    archive = tmp_path / "archive"
+    discovery = YouTubeDownloader(
+        downloads, archive, tmp_path / "manifest.json", discovery_only=True
+    )
+    metadata_instance = MagicMock()
+    metadata_instance.__enter__.return_value = metadata_instance
+    metadata_instance.extract_info.return_value = {
+        "entries": [metadata("one"), metadata("two")]
+    }
+    with patch(
+        "backend.services.youtube_downloader.yt_dlp.YoutubeDL",
+        return_value=metadata_instance,
+    ):
+        result = discovery.discover_recent_channel_metadata(
+            "Creator", CHANNEL_URL, 2
+        )
+    assert result.status is DownloadStatus.SUCCESS
+    assert [entry["id"] for entry in result.entries] == ["one", "two"]
+    assert not downloads.exists() and not archive.exists()
+    assert discovery.manifest is None
+
+
+def test_download_discovered_entry_reuses_single_entry_pipeline(downloader):
+    item = metadata()
+    with patch.object(
+        downloader, "_process_entries",
+        return_value=DownloadResult(
+            DownloadStatus.SUCCESS, VIDEO_URL, "downloaded", 1
+        ),
+    ) as process:
+        result = downloader.download_discovered_entry(
+            item, "Creator", CHANNEL_URL
+        )
+    assert result.status is DownloadStatus.SUCCESS
+    process.assert_called_once_with(
+        [item], VIDEO_URL, "Creator", CHANNEL_URL, download=True
+    )
 
 
 def test_success_updates_downloaded_path_and_timestamp(downloader):
