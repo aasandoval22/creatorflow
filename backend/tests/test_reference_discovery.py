@@ -4,15 +4,19 @@ import json
 from datetime import datetime, timezone
 from io import BytesIO, StringIO
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from backend.services.reference_clip_library import ReferenceClipLibrary
 from backend.services.reference_discovery import (
-    MediaEvidence, ReferenceCandidateQueue, ReferenceDiscoveryError,
-    ReferenceDiscoveryService, YouTubeDataAPI, infer_topic, main,
-    parse_iso_duration, score_candidate, select_diverse, views_per_day,
+    LocalMediaValidator, MediaEvidence, ReferenceCandidateQueue,
+    ReferenceDiscoveryError, ReferenceDiscoveryService, YouTubeDataAPI,
+    infer_topic, main, parse_iso_duration, score_candidate, select_diverse,
+    views_per_day,
 )
+from backend.services.youtube_downloader import YouTubeDownloader
 
 
 NOW = datetime(2026, 7, 25, tzinfo=timezone.utc)
@@ -54,6 +58,165 @@ def candidate(
         "media_path": None, "validation_error": None,
         "discovery_query": "gaming funny moments shorts",
         "captured_at": "2026-07-25T00:00:00Z", "topic": topic,
+    }
+
+
+def executable_deno(tmp_path, name="deno"):
+    path = tmp_path / ".deno" / "bin" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o700)
+    return path
+
+
+def test_reference_validation_and_downloader_share_explicit_deno_options(
+    tmp_path,
+):
+    deno = executable_deno(tmp_path)
+    validator = LocalMediaValidator(tmp_path / "media", deno_path=deno)
+    downloader = YouTubeDownloader(discovery_only=True, deno_path=deno)
+    expected = {"deno": {"path": str(deno)}}
+
+    assert validator._download_options(tmp_path / "candidate.mp4")[
+        "js_runtimes"
+    ] == expected
+    assert downloader._metadata_options()["js_runtimes"] == expected
+    assert downloader._build_options()["js_runtimes"] == expected
+
+
+def test_reference_validation_detects_standard_deno_without_shell_path(
+    tmp_path, monkeypatch,
+):
+    deno = executable_deno(tmp_path)
+    monkeypatch.setattr(
+        "backend.services.youtube_downloader.DEFAULT_DENO_PATH", deno
+    )
+    monkeypatch.delenv("AUTOCLIP_DENO_PATH", raising=False)
+    monkeypatch.setattr(
+        "backend.services.youtube_downloader.shutil.which", lambda _name: None
+    )
+
+    validator = LocalMediaValidator(tmp_path / "media")
+
+    assert validator.deno_path == deno
+    assert validator._download_options(tmp_path / "candidate.mp4")[
+        "js_runtimes"
+    ] == {"deno": {"path": str(deno)}}
+
+
+def test_reference_validation_detects_environment_deno(tmp_path, monkeypatch):
+    deno = executable_deno(tmp_path)
+    monkeypatch.setenv("AUTOCLIP_DENO_PATH", str(deno))
+    monkeypatch.setattr(
+        "backend.services.youtube_downloader.DEFAULT_DENO_PATH",
+        tmp_path / "missing-standard-deno",
+    )
+    monkeypatch.setattr(
+        "backend.services.youtube_downloader.shutil.which", lambda _name: None
+    )
+
+    validator = LocalMediaValidator(tmp_path / "media")
+
+    assert validator.deno_path == deno
+    assert validator._download_options(tmp_path / "candidate.mp4")[
+        "js_runtimes"
+    ] == {"deno": {"path": str(deno)}}
+
+
+def test_reference_validation_missing_deno_warns_and_continues(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.delenv("AUTOCLIP_DENO_PATH", raising=False)
+    monkeypatch.setattr(
+        "backend.services.youtube_downloader.DEFAULT_DENO_PATH",
+        tmp_path / "missing-standard-deno",
+    )
+    monkeypatch.setattr(
+        "backend.services.youtube_downloader.shutil.which", lambda _name: None
+    )
+
+    with pytest.warns(RuntimeWarning, match="Deno JavaScript runtime was not found"):
+        validator = LocalMediaValidator(tmp_path / "media")
+
+    assert validator.deno_path is None
+    assert "js_runtimes" not in validator._download_options(
+        tmp_path / "candidate.mp4"
+    )
+
+
+def test_reference_validation_preserves_symlinked_deno_path(
+    tmp_path, monkeypatch,
+):
+    target = executable_deno(tmp_path, "deno-real")
+    configured = target.with_name("deno-link")
+    configured.symlink_to(target)
+    monkeypatch.setenv("AUTOCLIP_DENO_PATH", str(configured))
+
+    validator = LocalMediaValidator(tmp_path / "media")
+
+    assert validator.deno_path == configured
+    assert validator.deno_path != configured.resolve()
+    assert validator._download_options(tmp_path / "candidate.mp4")[
+        "js_runtimes"
+    ] == {"deno": {"path": str(configured)}}
+
+
+def test_reference_youtube_dl_call_includes_shared_runtime_options(tmp_path):
+    deno = executable_deno(tmp_path)
+    captured = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            captured.append(options)
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def download(self, urls):
+            assert urls == ["https://www.youtube.com/watch?v=one"]
+            Path(self.options["outtmpl"]).write_bytes(b"fixture-media")
+            return 0
+
+    probe = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "width": 1080,
+                        "height": 1920,
+                        "avg_frame_rate": "60/1",
+                    },
+                    {"codec_type": "audio"},
+                ],
+                "format": {"duration": "45"},
+            }
+        ),
+        stderr="",
+    )
+    validator = LocalMediaValidator(tmp_path / "media", deno_path=deno)
+
+    with (
+        patch(
+            "backend.services.reference_discovery.yt_dlp.YoutubeDL",
+            FakeYoutubeDL,
+        ),
+        patch(
+            "backend.services.reference_discovery.subprocess.run",
+            return_value=probe,
+        ),
+    ):
+        evidence = validator.validate(candidate(), retain=False)
+
+    assert evidence.valid_short
+    assert len(captured) == 1
+    assert captured[0]["js_runtimes"] == {
+        "deno": {"path": str(deno)}
     }
 
 

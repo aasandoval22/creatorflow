@@ -162,7 +162,8 @@ AUTOCLIP_REVIEW_ARGS=--port 8080
 ```
 
 YouTube discovery and downloads explicitly configure yt-dlp's Deno JavaScript
-runtime. CreatorFlow checks `AUTOCLIP_DENO_PATH`, then
+runtime. CreatorFlow's production downloader and reference-discovery media
+validator share the same configuration: they check `AUTOCLIP_DENO_PATH`, then
 `~/.deno/bin/deno`, then `PATH`. This gives interactive and systemd-managed
 runs identical behavior even when the user service PATH omits the Deno install
 directory. If no executable runtime is available, yt-dlp continues with a

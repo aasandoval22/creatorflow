@@ -24,6 +24,10 @@ import yt_dlp
 from backend.services.reference_clip_analyzer import ReferenceClipAnalyzer
 from backend.services.reference_clip_library import ReferenceClipLibrary
 from backend.services.video_manifest import utc_now
+from backend.services.youtube_downloader import (
+    YtDlpRuntimeConfiguration,
+    build_ytdlp_runtime_configuration,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -295,9 +299,28 @@ class LocalMediaValidator:
     def __init__(
         self, media_root: Path = DEFAULT_MEDIA_ROOT, *,
         ffprobe_path: str = "ffprobe",
+        deno_path: Path | str | None = None,
     ) -> None:
         self.media_root = Path(media_root)
         self.ffprobe_path = ffprobe_path
+        self.runtime_configuration: YtDlpRuntimeConfiguration = (
+            build_ytdlp_runtime_configuration(
+                deno_path,
+                warning_stacklevel=3,
+            )
+        )
+        self.deno_path = self.runtime_configuration.deno_path
+
+    def _download_options(self, output: Path) -> dict[str, Any]:
+        return {
+            "format": "bestvideo*+bestaudio/best",
+            "merge_output_format": "mp4",
+            "outtmpl": str(output),
+            "noplaylist": True,
+            "quiet": True,
+            "overwrites": False,
+            **self.runtime_configuration.options(),
+        }
 
     def validate(self, candidate: Mapping[str, Any], *, retain: bool = True) -> MediaEvidence:
         self.media_root.mkdir(parents=True, exist_ok=True)
@@ -305,14 +328,7 @@ class LocalMediaValidator:
         output = self.media_root / f"{video_id}.mp4"
         try:
             with yt_dlp.YoutubeDL(
-                {
-                    "format": "bestvideo*+bestaudio/best",
-                    "merge_output_format": "mp4",
-                    "outtmpl": str(output),
-                    "noplaylist": True,
-                    "quiet": True,
-                    "overwrites": False,
-                }
+                self._download_options(output)
             ) as downloader:
                 downloader.download([candidate["source_url"]])
             completed = output if output.is_file() else next(
