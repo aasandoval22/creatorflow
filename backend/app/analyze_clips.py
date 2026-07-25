@@ -45,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-duration", type=positive_number, default=35)
     parser.add_argument("--maximum-duration", type=positive_number, default=60)
     parser.add_argument("--maximum-candidates", type=positive_integer, default=10)
+    parser.add_argument(
+        "--show-score-breakdown",
+        action="store_true",
+        help="Print component scores and candidate-specific reasons.",
+    )
     return parser
 
 
@@ -81,6 +86,27 @@ def main(argv: Sequence[str] | None = ()) -> int:
                 f"{candidate['end']:.3f} ({candidate['duration']:.3f}s) "
                 f"score {candidate['score']:.1f}"
             )
+            if args.show_score_breakdown:
+                print(
+                    f"    Ending classification: "
+                    f"{candidate['ending_classification']}"
+                )
+                components = ", ".join(
+                    f"{name}={value:.1f}"
+                    for name, value in candidate["component_scores"].items()
+                )
+                positives = [
+                    reason for reason in candidate["reasons"]
+                    if not reason.startswith("Penalized")
+                ]
+                penalties = [
+                    reason for reason in candidate["reasons"]
+                    if reason.startswith("Penalized")
+                ]
+                print(f"    Components: {components}")
+                print("    Component rounding tolerance: 0.1")
+                print(f"    Positive reasons: {'; '.join(positives) or 'None'}")
+                print(f"    Penalties: {'; '.join(penalties) or 'None'}")
     print(
         f"Summary: {batch.successful} successful, "
         f"{batch.skipped} skipped, {batch.failed} failed."

@@ -60,6 +60,57 @@ INTRO = (
 )
 OUTRO = ("thanks for watching", "see you next time", "until next time")
 FILLERS = {"um", "uh", "erm", "like", "you know", "basically", "actually"}
+SELF_CONTAINED_OPENERS = (
+    "how ",
+    "why ",
+    "the problem",
+    "the reason",
+    "what i like",
+    "the best",
+    "here is",
+    "here's",
+    "you should",
+    "if you",
+    "this build",
+    "this setup",
+)
+CONTINUATION_OPENERS = (
+    "and ",
+    "but ",
+    "so ",
+    "because ",
+    "which ",
+    "that ",
+    "it ",
+    "this is where",
+    "does not ",
+    "made ",
+    "range ",
+    "grenade ",
+    "that's fine",
+)
+INCOMPLETE_ENDINGS = (
+    "and",
+    "but",
+    "or",
+    "so",
+    "because",
+    "which",
+    "that",
+    "if",
+    "when",
+    "while",
+    "to",
+    "with",
+    "for example",
+    "the reason is",
+    "here's why",
+)
+SUBJECT_PRONOUNS = {"i", "you", "he", "she", "we", "they", "it", "this", "that"}
+CONCRETE_TERMS = {
+    "build", "setup", "cooldown", "damage", "weapon", "armor", "grenade",
+    "range", "banner", "mechanic", "perk", "skill", "seconds", "percent",
+}
 
 
 class TranscriptError(ValueError):
@@ -70,6 +121,22 @@ class AnalysisResultStatus(str, Enum):
     SUCCESS = "success"
     SKIPPED = "skipped"
     FAILED = "failed"
+
+
+class EndingClassification(str, Enum):
+    STRONG_COMPLETE = "strong_complete"
+    ACCEPTABLE_COMPLETE_WITHOUT_PUNCTUATION = (
+        "acceptable_complete_without_punctuation"
+    )
+    UNCERTAIN = "uncertain"
+    INCOMPLETE = "incomplete"
+
+
+@dataclass(frozen=True)
+class EndingAssessment:
+    classification: EndingClassification
+    score: float
+    reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -297,7 +364,10 @@ class ClipCandidateGenerator:
         config = self.configuration
         raw = []
         for start_index, first in enumerate(segments):
+            previous = segments[start_index - 1] if start_index else None
+            start_score, start_reasons = self._assess_start(first, previous)
             words = []
+            choices = []
             for end_index in range(start_index, len(segments)):
                 last = segments[end_index]
                 duration = last["end"] - first["start"]
@@ -309,25 +379,33 @@ class ClipCandidateGenerator:
                     and len(words) >= config.minimum_word_count
                 ):
                     window = segments[start_index : end_index + 1]
-                    pause_before = (
-                        start_index > 0
-                        and first["start"] - segments[start_index - 1]["end"]
-                        >= 0.75
+                    candidate = self._make_candidate(
+                        video_id,
+                        window,
+                        previous_segment=previous,
+                        start_assessment=(start_score, start_reasons),
                     )
-                    raw.append(
-                        self._make_candidate(
-                            video_id, window, boundary_start=pause_before
-                        )
+                    choices.append(candidate)
+            if choices:
+                # One window per starting point: favor complete thoughts near the
+                # target instead of emitting the first window over the minimum.
+                choices.sort(
+                    key=lambda c: (
+                        -(
+                            c["component_scores"]["end_boundary_score"]
+                            + c["component_scores"]["duration_fit_score"]
+                        ),
+                        -c["score"],
+                        c["end"],
                     )
-                    if duration >= config.target_duration_seconds:
-                        break
-        raw.sort(key=lambda c: (-c["score"], c["start"], c["end"]))
+                )
+                raw.append(choices[0])
+        raw.sort(key=self._candidate_sort_key)
         accepted = []
-        seen_text = []
         for candidate in raw:
             duplicate = any(
-                self._text_similarity(candidate["text"], text) >= 0.85
-                for text in seen_text
+                self._text_similarity(candidate["text"], existing["text"]) >= 0.72
+                for existing in accepted
             )
             overlap = any(
                 self._overlap_fraction(candidate, existing)
@@ -337,9 +415,9 @@ class ClipCandidateGenerator:
             if duplicate or overlap:
                 continue
             accepted.append(candidate)
-            seen_text.append(candidate["text"])
             if len(accepted) >= config.maximum_candidates:
                 break
+        accepted.sort(key=self._final_rank_sort_key)
         for rank, candidate in enumerate(accepted, 1):
             candidate["rank"] = rank
         return accepted
@@ -349,19 +427,37 @@ class ClipCandidateGenerator:
         video_id: str,
         segments: list[dict[str, Any]],
         *,
-        boundary_start: bool = False,
+        previous_segment: dict[str, Any] | None = None,
+        start_assessment: tuple[float, list[str]] | None = None,
     ) -> dict[str, Any]:
         start, end = segments[0]["start"], segments[-1]["end"]
         text = " ".join(s["text"] for s in segments if s["text"]).strip()
         components, reasons = self.score_candidate(
-            text, end - start, segments
+            text,
+            end - start,
+            segments,
+            target_duration=self.configuration.target_duration_seconds,
         )
-        if boundary_start:
-            components["standalone_score"] = min(
-                18, components["standalone_score"] + 2
+        start_score, start_reasons = start_assessment or self._assess_start(
+            segments[0], previous_segment
+        )
+        ending = self._assess_end(segments[-1])
+        components["start_boundary_score"] = start_score
+        components["end_boundary_score"] = ending.score
+        reasons = start_reasons + reasons + list(ending.reasons)
+        serialized_components = {
+            name: round(value, 1) for name, value in components.items()
+        }
+        serialized_total = round(sum(serialized_components.values()), 1)
+        if serialized_total > 100.0:
+            serialized_components["score_cap_adjustment"] = round(
+                100.0 - serialized_total, 1
             )
-            reasons.append("Starts after a meaningful pause")
-        score = max(0.0, min(100.0, sum(components.values())))
+        elif serialized_total < 0.0:
+            serialized_components["score_floor_adjustment"] = round(
+                -serialized_total, 1
+            )
+        score = round(sum(serialized_components.values()), 1)
         identity = f"{video_id}:{start:.3f}:{end:.3f}".encode()
         return {
             "rank": 0,
@@ -370,65 +466,122 @@ class ClipCandidateGenerator:
             "end": round(end, 3),
             "duration": round(end - start, 3),
             "text": text,
-            "score": round(score, 1),
-            "component_scores": components,
+            "score": score,
             "reasons": reasons,
+            "ending_classification": ending.classification.value,
+            "component_scores": serialized_components,
             "segment_ids": [s["id"] for s in segments],
         }
 
     @staticmethod
     def score_candidate(
-        text: str, duration: float, segments: list[dict[str, Any]] | None = None
-    ) -> tuple[dict[str, int], list[str]]:
+        text: str,
+        duration: float,
+        segments: list[dict[str, Any]] | None = None,
+        *,
+        target_duration: float = 35,
+    ) -> tuple[dict[str, float], list[str]]:
         lower = text.lower()
         words = WORD_RE.findall(lower)
         reasons = []
-        hook = 5
-        if "?" in text or lower.startswith(("why ", "how ", "what ")):
-            hook += 5
-            reasons.append("Opens with or contains a question")
+        hook = 2.0
+        first_sentence = re.split(r"(?<=[.!?])\s+", lower, maxsplit=1)[0]
+        if lower.startswith(("why ", "how ", "what ")):
+            hook += 5.5
+            if "?" in first_sentence and len(re.split(r"(?<=[.!?])\s+", text)) > 1:
+                reasons.append("Begins with a direct question and immediately answers it")
+            else:
+                reasons.append("Begins with a direct question")
         if any(phrase in lower for phrase in EXPLANATIONS):
-            hook += 6
-            reasons.append("Contains a strong explanation or recommendation")
-        standalone = 10
-        if lower.startswith(("and ", "but ", "so ", "this ", "that ", "it ")):
-            standalone -= 5
-            reasons.append("Opening depends on earlier context")
-        else:
-            standalone += 4
-            reasons.append("Opens as a standalone thought")
-        density = min(15, round((len(words) / max(duration, 1)) * 7))
-        if density >= 11:
-            reasons.append("Has high spoken-word density")
-        excitement = min(12, 2 + 2 * len(re.findall(r"[!?]", text)))
+            hook += 3.5
+            reasons.append("Provides an explanation or recommendation")
+        density = min(9.0, (len(words) / max(duration, 1)) * 3.2)
+        excitement = min(6.0, 1.0 + 1.25 * len(re.findall(r"[!?]", text)))
+        specificity = min(
+            12.0,
+            2.0
+            + 1.4 * len(set(words) & CONCRETE_TERMS)
+            + 2.0 * bool(re.search(r"\b\d+(?:\.\d+)?(?:%| seconds?)?\b", lower)),
+        )
         if re.search(r"\b\d+(?:\.\d+)?\b", text):
-            excitement += 3
             reasons.append("Includes a concrete number or detail")
-        clarity = 12
+        elif len(set(words) & CONCRETE_TERMS) >= 2:
+            reasons.append("Names specific mechanics or equipment")
+        clarity = 7.0
         filler_count = sum(word in FILLERS for word in words)
         filler_ratio = filler_count / max(len(words), 1)
         if filler_ratio < 0.04:
-            clarity += 4
+            clarity += 2.5
             reasons.append("Uses clear, low-filler language")
-        completion = 5
-        if text.rstrip().endswith((".", "!", "?")):
-            completion += 9
-            reasons.append("Ends with a complete statement")
-        penalty = 0
+        context = 9.0
+        opening_words = words[:10]
+        pronoun_ratio = sum(word in SUBJECT_PRONOUNS for word in opening_words) / max(
+            1, len(opening_words)
+        )
+        if pronoun_ratio >= 0.3:
+            context -= 5.5
+            reasons.append("Penalized because the opening is pronoun-heavy")
+        elif any(term in first_sentence for term in CONCRETE_TERMS):
+            context += 3.0
+            reasons.append("Introduces the topic without requiring prior context")
+        duration_fit = max(
+            0.0, 12.0 * (1.0 - abs(duration - target_duration) / max(target_duration, 1))
+        )
+        if abs(duration - target_duration) <= max(3.0, target_duration * 0.12):
+            reasons.append("Duration is close to the configured target")
+        structure = 1.0
+        if "?" in first_sentence and len(re.split(r"[.!?]+", text)) >= 2:
+            structure += 3.0
+        if "problem" in lower and any(word in lower for word in ("solution", "fix", "instead")):
+            structure += 3.5
+            reasons.append("Presents a problem followed by a solution")
+        if any(word in lower for word in ("should", "recommend")) and "because" in lower:
+            structure += 2.5
+            reasons.append("Supports an actionable recommendation with an explanation")
+        if any(f" {word} " in f" {lower} " for word in ("but", "however", "instead")):
+            structure += 1.5
+            reasons.append("Includes a self-contained contrast")
+        penalty = 0.0
+        concrete_count = len(set(words) & CONCRETE_TERMS)
+        has_payoff = any(
+            phrase in lower
+            for phrase in (
+                "because",
+                "the reason",
+                "you should",
+                "recommend",
+                "so that",
+                "therefore",
+                "takeaway",
+            )
+        )
+        if concrete_count >= 3 and not has_payoff and "?" not in text:
+            penalty -= 5.0
+            reasons.append(
+                "Penalized because it lists equipment or mechanics without a takeaway"
+            )
         penalties = (
-            (SPONSOR, -28, "Contains sponsor or advertisement language"),
-            (CTA, -18, "Contains a call to action"),
-            (INTRO, -15, "Contains greeting or channel introduction language"),
-            (OUTRO, -18, "Contains outro language"),
+            (
+                SPONSOR,
+                -28,
+                "Penalized because it contains sponsor or advertisement language",
+            ),
+            (CTA, -18, "Penalized because it contains a call to action"),
+            (
+                INTRO,
+                -15,
+                "Penalized because it contains greeting or channel introduction language",
+            ),
+            (OUTRO, -18, "Penalized because it contains outro language"),
         )
         for phrases, value, reason in penalties:
             if any(phrase in lower for phrase in phrases):
                 penalty += value
                 reasons.append(reason)
         if filler_ratio >= 0.08:
-            value = -min(15, round(filler_ratio * 100))
+            value = -min(15.0, filler_ratio * 100)
             penalty += value
-            reasons.append("Contains excessive filler words")
+            reasons.append("Penalized because it contains excessive filler words")
         sentences = [
             sentence.strip().lower()
             for sentence in re.split(r"[.!?]+", text)
@@ -436,20 +589,129 @@ class ClipCandidateGenerator:
         ]
         if len(sentences) != len(set(sentences)):
             penalty -= 8
-            reasons.append("Repeats substantially duplicate statements")
-        if len(words) > 80 and not text.rstrip().endswith((".", "!", "?")):
-            penalty -= 10
-            reasons.append("Ends with a very long incomplete statement")
+            reasons.append("Penalized because it repeats substantially duplicate statements")
         components = {
-            "hook_score": min(20, hook),
-            "standalone_score": max(0, min(18, standalone)),
-            "information_density_score": max(0, density),
-            "excitement_score": min(15, excitement),
-            "clarity_score": min(18, clarity),
-            "completion_score": min(14, completion),
+            "hook_score": min(11.0, hook),
+            "information_density_score": max(0.0, density),
+            "excitement_score": excitement,
+            "clarity_score": min(10.0, clarity),
+            "specificity_score": specificity,
+            "context_independence_score": max(0.0, min(12.0, context)),
+            "duration_fit_score": duration_fit,
+            "structure_score": min(10.0, structure),
             "penalty_score": penalty,
         }
         return components, reasons
+
+    @staticmethod
+    def _assess_start(
+        segment: dict[str, Any], previous: dict[str, Any] | None
+    ) -> tuple[float, list[str]]:
+        text = segment["text"].strip()
+        lower = text.lower()
+        score = 7.0
+        reasons: list[str] = []
+        pause = (
+            previous is not None and segment["start"] - previous["end"] >= 0.75
+        )
+        prior_complete = previous is None or previous["text"].rstrip().endswith(
+            (".", "!", "?")
+        )
+        if prior_complete:
+            score += 3.0
+            reasons.append("Begins after a completed sentence")
+        if pause:
+            score += 3.0
+            reasons.append("Begins after a meaningful pause")
+        if lower.startswith(SELF_CONTAINED_OPENERS):
+            score += 5.0
+            reasons.append("Uses a self-contained opening")
+        if lower.startswith(CONTINUATION_OPENERS):
+            score -= 8.0
+            reasons.append("Penalized because the opening continues a previous thought")
+        if lower.startswith("we have ") and previous is not None and not prior_complete:
+            score -= 6.0
+            reasons.append("Penalized because the opening starts mid-list")
+        first_words = WORD_RE.findall(lower)[:8]
+        if first_words and first_words[0] in SUBJECT_PRONOUNS and not lower.startswith(
+            ("you should", "this build", "this setup")
+        ):
+            score -= 2.5
+        return max(0.0, min(18.0, score)), reasons
+
+    @staticmethod
+    def _assess_end(segment: dict[str, Any]) -> EndingAssessment:
+        text = segment["text"].strip()
+        lower = text.lower().rstrip(" ,;:")
+        semantic_end = lower.rstrip(" .!?")
+        punctuated = text.endswith((".", "!", "?"))
+        incomplete = any(
+            semantic_end.endswith(ending) for ending in INCOMPLETE_ENDINGS
+        )
+        introducing = bool(
+            re.search(
+                r"\b(?:first|next|another|the reason is|here's why)[,:]?\s*$",
+                semantic_end,
+            )
+        )
+        dependent_clause = semantic_end.startswith(
+            ("because ", "which ", "although ", "unless ", "while ", "when ")
+        )
+        trailing_separator = text.endswith((",", ";", ":"))
+        inferred_complete = (
+            not punctuated
+            and not incomplete
+            and not introducing
+            and not dependent_clause
+            and not trailing_separator
+            and len(WORD_RE.findall(semantic_end)) >= 6
+            and not semantic_end.startswith(
+                ("and ", "but ", "so ", "because ", "which ")
+            )
+        )
+        if incomplete or introducing or dependent_clause or trailing_separator:
+            return EndingAssessment(
+                EndingClassification.INCOMPLETE,
+                0.0,
+                ("Penalized because the ending is incomplete",),
+            )
+        if punctuated:
+            return EndingAssessment(
+                EndingClassification.STRONG_COMPLETE,
+                14.0,
+                ("Ends with a complete takeaway",),
+            )
+        if inferred_complete:
+            return EndingAssessment(
+                EndingClassification.ACCEPTABLE_COMPLETE_WITHOUT_PUNCTUATION,
+                9.0,
+                ("Ends with a complete statement despite missing punctuation",),
+            )
+        return EndingAssessment(EndingClassification.UNCERTAIN, 4.0, ())
+
+    @staticmethod
+    def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[float, ...]:
+        components = candidate["component_scores"]
+        return (
+            -components["start_boundary_score"],
+            -components["end_boundary_score"],
+            -components["duration_fit_score"],
+            -candidate["score"],
+            candidate["start"],
+            candidate["end"],
+        )
+
+    @staticmethod
+    def _final_rank_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
+        components = candidate["component_scores"]
+        return (
+            -candidate["score"],
+            -components["start_boundary_score"],
+            -components["end_boundary_score"],
+            -components["duration_fit_score"],
+            candidate["start"],
+            candidate["candidate_id"],
+        )
 
     @staticmethod
     def _overlap_fraction(a: dict[str, Any], b: dict[str, Any]) -> float:
@@ -458,8 +720,16 @@ class ClipCandidateGenerator:
 
     @staticmethod
     def _text_similarity(a: str, b: str) -> float:
-        left, right = set(WORD_RE.findall(a.lower())), set(WORD_RE.findall(b.lower()))
-        return len(left & right) / max(1, len(left | right))
+        left_words = WORD_RE.findall(a.lower())
+        right_words = WORD_RE.findall(b.lower())
+        left, right = set(left_words), set(right_words)
+        containment = len(left & right) / max(1, min(len(left), len(right)))
+        left_bigrams = set(zip(left_words, left_words[1:]))
+        right_bigrams = set(zip(right_words, right_words[1:]))
+        passage = len(left_bigrams & right_bigrams) / max(
+            1, min(len(left_bigrams), len(right_bigrams))
+        )
+        return max(containment, passage)
 
     def _write_artifact(
         self,

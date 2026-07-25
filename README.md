@@ -111,6 +111,7 @@ Selection and configuration examples:
 python -m backend.app.analyze_clips --video-id VIDEO_ID
 python -m backend.app.analyze_clips --video-id VIDEO_ID --force
 python -m backend.app.analyze_clips --minimum-duration 25 --target-duration 40 --maximum-duration 55
+python -m backend.app.analyze_clips --video-id VIDEO_ID --show-score-breakdown
 ```
 
 Ranked artifacts are written to
@@ -119,4 +120,7 @@ deterministic text and timing heuristics: identical transcript input and
 configuration produce identical candidate boundaries, IDs, and scores.
 Heuristic scores prioritize potentially self-contained moments; they do not
 predict actual popularity or virality. This stage does not cut, render,
-upload, or publish video.
+upload, or publish video. Add `--show-score-breakdown` to print each returned
+candidate's ending classification, component scores, positive reasons, and
+penalties. Displayed components sum to the displayed total within a 0.1
+rounding tolerance. Normal output is unchanged when the flag is omitted.
