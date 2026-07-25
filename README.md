@@ -99,7 +99,7 @@ decode real media, or perform real transcription.
 ## Transcript clip-candidate analysis
 
 CreatorFlow's local workflow is ingestion → transcription → candidate analysis
-→ local preview rendering. Analyze all eligible downloaded videos with
+→ batch preview rendering → local human review. Analyze all eligible downloaded videos with
 completed transcripts:
 
 ```bash
@@ -165,3 +165,36 @@ The original audio is retained when present.
 
 Rendering, probing, caption generation, and artifact storage remain entirely
 local. This command does not upload, publish, post, or call a platform API.
+
+## Batch previews and local review
+
+Render the top three ranked candidates, a larger top set, or explicit ranks:
+
+```bash
+python -m backend.app.render_previews --video-id VIDEO_ID
+python -m backend.app.render_previews --video-id VIDEO_ID --top 4
+python -m backend.app.render_previews --video-id VIDEO_ID --ranks 1,3
+```
+
+Successful previews and valid existing previews are recorded in the versioned
+local queue at `data/review_queue/reviews.json`. The queue preserves human
+decisions when preview metadata or paths are refreshed. List pending clips and
+record decisions:
+
+```bash
+python -m backend.app.review_clips list --status pending
+python -m backend.app.review_clips approve REVIEW_ID
+python -m backend.app.review_clips reject REVIEW_ID --note "Needs a stronger opening"
+python -m backend.app.review_clips pending REVIEW_ID
+```
+
+Build the read-only local HTML index:
+
+```bash
+python -m backend.app.review_clips build-index
+python -m http.server 8080 --directory data
+```
+
+The server command is optional and must be started intentionally; the review
+command never starts a server. Approval is local review state only. It does not
+upload, schedule, or publish a clip anywhere.

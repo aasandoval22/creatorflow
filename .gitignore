@@ -31,6 +31,7 @@ data/transcripts/**/.*.tmp
 data/clip_candidates/
 data/clip_candidates/**/.*.tmp
 data/previews/
+data/review_queue/
 data/models/
 .cache/huggingface/
 .cache/whisper/
@@ -42,6 +43,9 @@ data/models/
 *.tmp.ass
 .captions.*
 .preview.json.*
+.reviews.*
+.review-index.*
+.batch-preview.*
 
 # macOS
 .DS_Store
