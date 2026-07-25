@@ -101,6 +101,89 @@ This command is manually invoked. It does not install a scheduler, start the
 review server, upload media, or publish to YouTube, TikTok, or any other
 platform.
 
+## Unattended production services
+
+CreatorFlow includes repository-managed systemd user units for the loopback
+review server and scheduled production runner. Install the units for the
+current repository checkout:
+
+```bash
+.venv/bin/python -m backend.services.autoclip_service install
+```
+
+Installation renders the tracked templates in `deploy/systemd/` into
+`~/.config/systemd/user/` using absolute paths to this repository and its
+virtual environment. It is atomic and idempotent: rerunning it updates the
+same three unit files without creating duplicate services or timers. It also
+creates `~/.config/creatorflow/creatorflow.env` with mode `0600` if that local
+configuration file does not exist. Existing environment-file content is never
+overwritten.
+
+The default production interval is 30 minutes. Set another positive systemd
+duration during installation without editing Python source:
+
+```bash
+.venv/bin/python -m backend.services.autoclip_service install --interval 2h
+```
+
+Optional production-runner and review-server arguments belong in the local
+environment file outside the repository:
+
+```text
+AUTOCLIP_PRODUCTION_ARGS=--max-videos 2 --top 2
+AUTOCLIP_REVIEW_ARGS=--port 8080
+```
+
+Keep the review server loopback-bound. The managed unit always supplies
+`--host 127.0.0.1`; use an SSH tunnel for remote browser access as described
+below. Do not put secrets in the environment file unless the local host
+requires them for some separately managed dependency.
+
+Manage the services with one entry point:
+
+```bash
+.venv/bin/python -m backend.services.autoclip_service start
+.venv/bin/python -m backend.services.autoclip_service stop
+.venv/bin/python -m backend.services.autoclip_service restart
+.venv/bin/python -m backend.services.autoclip_service status
+.venv/bin/python -m backend.services.autoclip_service logs
+.venv/bin/python -m backend.services.autoclip_service logs --lines 250
+.venv/bin/python -m backend.services.autoclip_service run-now
+.venv/bin/python -m backend.services.autoclip_service disable
+```
+
+`start` enables and starts the review service and production timer. The review
+service uses `Restart=on-failure` with a five-second delay. The timer waits five
+minutes after activation before its first run, then uses the configured
+interval. `stop` gracefully stops the timer, an active production unit, and the
+review server. `disable` disables only automatic production and leaves the
+review server unchanged.
+`run-now` invokes the same oneshot production service immediately. Scheduled
+and manual service runs retain `production_runner`'s nonblocking file lock, so
+they cannot overlap.
+
+`status` reports the review service and production timer states, the next timer
+event, the latest systemd production result, the most recent successful and
+failed timestamps found in `data/logs/production.jsonl`, the processing-state
+update time, the number of pending review items, and user-lingering status.
+`logs` reads recent production and review-service diagnostics from the user
+journal. Production JSON logs remain in `data/logs/production.jsonl`; both
+locations are local and ignored by Git.
+
+For enabled user units to start at boot and continue after logout, the account
+must have systemd user lingering enabled. The installer only detects and
+reports this state; it never uses sudo or changes it. When it reports
+`Linger=no`, an administrator must run this isolated one-time command:
+
+```bash
+sudo loginctl enable-linger aasandoval
+```
+
+Without lingering, the enabled units start when the user logs in rather than
+unattended at boot. No service in this layer publishes clips, changes selection
+or rendering behavior, exposes the review server publicly, or modifies SSH,
+UFW, WireGuard, router, or Cloudflare configuration.
+
 ## Local transcription
 
 Install the optional transcription runtime separately from development
