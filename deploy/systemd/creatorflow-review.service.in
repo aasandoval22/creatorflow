@@ -1,0 +1,17 @@
+[Unit]
+Description=CreatorFlow local review server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={project_root}
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-{environment_file}
+ExecStart={python_path} -m backend.app.review_server $AUTOCLIP_REVIEW_ARGS --host 127.0.0.1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target

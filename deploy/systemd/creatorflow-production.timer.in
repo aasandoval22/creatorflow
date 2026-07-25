@@ -1,0 +1,11 @@
+[Unit]
+Description=Run CreatorFlow production on a schedule
+
+[Timer]
+OnActiveSec=5m
+OnUnitInactiveSec={interval}
+Persistent=true
+Unit=creatorflow-production.service
+
+[Install]
+WantedBy=timers.target

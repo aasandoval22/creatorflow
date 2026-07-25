@@ -1,0 +1,13 @@
+[Unit]
+Description=CreatorFlow ingestion-to-review production cycle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory={project_root}
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-{environment_file}
+ExecStart={python_path} -m backend.services.production_runner $AUTOCLIP_PRODUCTION_ARGS
+TimeoutStopSec=120
+KillSignal=SIGINT
