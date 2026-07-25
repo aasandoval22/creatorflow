@@ -230,6 +230,7 @@ def test_status_and_health_reporting(tmp_path):
     assert status["most_recent_failure"] == "2026-07-25T20:30:00Z"
     assert status["processing_state_updated_at"] == "2026-07-25T20:30:01Z"
     assert status["awaiting_review"] == 1
+    assert status["deployment"]["deployed_commit"] is None
 
 
 def test_status_handles_missing_or_malformed_runtime_files(tmp_path):
@@ -256,8 +257,18 @@ def test_logs_uses_user_journal(tmp_path):
     )
 
 
-def test_cli_status_output(tmp_path):
+def test_cli_status_output(tmp_path, monkeypatch):
     service, _ = manager(tmp_path)
+    original_status = service.status
+    monkeypatch.setattr(
+        service,
+        "status",
+        lambda: original_status(
+            state_path=tmp_path / "state.json",
+            log_path=tmp_path / "production.jsonl",
+            review_queue_path=tmp_path / "reviews.json",
+        ),
+    )
     output = StringIO()
     assert autoclip_service.main(
         ["status"], manager=service, stdout=output, stderr=StringIO(),

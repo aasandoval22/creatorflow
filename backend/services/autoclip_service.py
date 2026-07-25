@@ -15,10 +15,16 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TextIO
 
 from backend.services.clip_review_queue import DEFAULT_REVIEW_QUEUE_PATH
+from backend.services.production_deployment import (
+    DeploymentError, ProcessResult, ProductionDeployer,
+)
 from backend.services.production_runner import DEFAULT_LOG_PATH, DEFAULT_STATE_PATH
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DEVELOPMENT_ROOT = Path.home() / "clip-factory"
+DEFAULT_PRODUCTION_ROOT = Path.home() / "clip-factory-production"
+DEFAULT_RUNTIME_ROOT = DEFAULT_PRODUCTION_ROOT / "current"
 TEMPLATE_DIRECTORY = PROJECT_ROOT / "deploy" / "systemd"
 DEFAULT_USER_CONFIG = Path.home() / ".config"
 DEFAULT_UNIT_DIRECTORY = DEFAULT_USER_CONFIG / "systemd" / "user"
@@ -98,23 +104,30 @@ def _atomic_write(path: Path, content: str) -> bool:
 
 class AutoClipServiceManager:
     def __init__(
-        self, *, project_root: Path = PROJECT_ROOT,
+        self, *, project_root: Path = DEFAULT_RUNTIME_ROOT,
         unit_directory: Path = DEFAULT_UNIT_DIRECTORY,
         environment_file: Path = DEFAULT_ENVIRONMENT_FILE,
-        template_directory: Path = TEMPLATE_DIRECTORY,
+        template_directory: Path | None = None,
+        support_python_path: Path | None = None,
         command_runner: CommandRunner = run_command,
     ) -> None:
-        self.project_root = Path(project_root).resolve()
+        self.project_root = Path(os.path.abspath(project_root))
         self.python_path = self.project_root / ".venv" / "bin" / "python"
+        self.support_python_path = Path(
+            os.path.abspath(support_python_path or self.python_path)
+        )
         self.unit_directory = Path(unit_directory).resolve()
         self.environment_file = Path(environment_file).resolve()
-        self.template_directory = Path(template_directory).resolve()
+        self.template_directory = Path(
+            template_directory or self.project_root / "deploy" / "systemd"
+        ).resolve()
         self.command_runner = command_runner
 
     def check_support(self) -> None:
-        if not self.python_path.is_file():
+        if not self.support_python_path.is_file():
             raise ServiceManagerError(
-                f"Repository virtual-environment Python is missing: {self.python_path}."
+                "Production virtual-environment Python is missing: "
+                f"{self.support_python_path}."
             )
         result = self.command_runner(("systemctl", "--user", "is-system-running"))
         state = result.stdout.strip()
@@ -182,6 +195,19 @@ class AutoClipServiceManager:
             "interval": interval,
             "linger": self.lingering(),
         }
+
+    def _deployment_status(self) -> dict[str, Any]:
+        return ProductionDeployer(
+            development_root=DEFAULT_DEVELOPMENT_ROOT,
+            production_root=DEFAULT_PRODUCTION_ROOT,
+            runner=self._deployment_command,
+        ).status()
+
+    def _deployment_command(
+        self, command: Sequence[str], _cwd: Path | None = None,
+    ) -> ProcessResult:
+        result = self.command_runner(command)
+        return ProcessResult(result.returncode, result.stdout, result.stderr)
 
     def start(self) -> None:
         self.check_support()
@@ -252,6 +278,7 @@ class AutoClipServiceManager:
             "processing_state_updated_at": _state_updated_at(Path(state_path)),
             "awaiting_review": _pending_review_count(Path(review_queue_path)),
             "linger": self.lingering(),
+            "deployment": self._deployment_status(),
         }
 
     def _next_timer_run(self) -> str | None:
@@ -374,6 +401,9 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--interval", type=validate_interval, default=DEFAULT_INTERVAL)
     for name in ("start", "stop", "restart", "status", "run-now", "disable"):
         commands.add_parser(name)
+    deploy = commands.add_parser("deploy")
+    deploy.add_argument("--interval", type=validate_interval, default=DEFAULT_INTERVAL)
+    commands.add_parser("rollback")
     logs = commands.add_parser("logs")
     logs.add_argument("--lines", type=int, default=100)
     return parser
@@ -395,11 +425,27 @@ def _print_status(status: Mapping[str, Any], stream: TextIO) -> None:
     pending = status["awaiting_review"]
     print(f"Awaiting review: {pending if pending is not None else 'unavailable'}", file=stream)
     print(f"User lingering: {status['linger']}", file=stream)
+    deployment = status.get("deployment") or {}
+    print(
+        f"Deployed commit: {deployment.get('deployed_commit') or 'none'}",
+        file=stream,
+    )
+    print(
+        f"Origin main commit: {deployment.get('origin_main_commit') or 'unavailable'}",
+        file=stream,
+    )
+    behind = deployment.get("production_behind_main")
+    print(
+        "Production behind main: "
+        + ("unknown" if behind is None else ("yes" if behind else "no")),
+        file=stream,
+    )
 
 
 def main(
     argv: Sequence[str] | None = (), *,
     manager: AutoClipServiceManager | None = None,
+    deployer: ProductionDeployer | None = None,
     stdout: TextIO = sys.stdout, stderr: TextIO = sys.stderr,
 ) -> int:
     args = build_parser().parse_args(argv)
@@ -440,7 +486,14 @@ def main(
             print(manager.logs(args.lines).stdout, end="", file=stdout)
         elif args.command == "status":
             _print_status(manager.status(), stdout)
-    except ServiceManagerError as error:
+        elif args.command in {"deploy", "rollback"}:
+            deployer = deployer or ProductionDeployer(development_root=PROJECT_ROOT)
+            result = (
+                deployer.deploy(interval=args.interval)
+                if args.command == "deploy" else deployer.rollback()
+            )
+            print(json.dumps(result, indent=2, sort_keys=True), file=stdout)
+    except (ServiceManagerError, DeploymentError) as error:
         print(f"CreatorFlow service error: {error}", file=stderr)
         return 1
     return 0
