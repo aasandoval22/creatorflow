@@ -99,7 +99,8 @@ decode real media, or perform real transcription.
 ## Transcript clip-candidate analysis
 
 CreatorFlow's local workflow is ingestion → transcription → candidate analysis
-→ batch preview rendering → local human review. Analyze all eligible downloaded videos with
+→ batch preview rendering → local human review → timing correction and
+re-review. Analyze all eligible downloaded videos with
 completed transcripts:
 
 ```bash
@@ -198,3 +199,38 @@ python -m http.server 8080 --directory data
 The server command is optional and must be started intentionally; the review
 command never starts a server. Approval is local review state only. It does not
 upload, schedule, or publish a clip anywhere.
+
+### Review-time timing correction
+
+Transcript boundaries are useful for finding a spoken moment, but visual
+context may happen earlier and a reaction or answer may happen later. A
+reviewer can expand the preview without changing the analyzed candidate,
+candidate score, or rank:
+
+```bash
+# Add visual context before the candidate.
+python -m backend.app.review_clips adjust REVIEW_ID --lead-in 10
+
+# Keep a reaction or answer after the candidate.
+python -m backend.app.review_clips adjust REVIEW_ID --tail 8
+
+# Add both.
+python -m backend.app.review_clips adjust REVIEW_ID --lead-in 12 --tail 4
+
+# Set explicit bounds that contain the original candidate.
+python -m backend.app.review_clips adjust REVIEW_ID --render-start 800 --render-end 850
+
+# Validate the source bounds and inspect the FFmpeg command without changing files.
+python -m backend.app.review_clips adjust REVIEW_ID --tail 8 --dry-run
+
+# Render the original candidate window again.
+python -m backend.app.review_clips reset-timing REVIEW_ID
+```
+
+Relative adjustments are always calculated from the original candidate, not
+from the previous preview. The default maximum adjusted duration is 60 seconds;
+use `--allow-longer` only after reviewing the dry-run output. A verified
+replacement increments the timing revision and returns the item to `pending`
+for another human review. Existing notes are preserved unless `--note` replaces
+one or `--clear-note` clears it. Preview replacement is local and atomic: a
+failed render or probe leaves the prior valid preview and queue state intact.

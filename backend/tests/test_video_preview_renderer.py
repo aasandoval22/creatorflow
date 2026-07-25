@@ -304,3 +304,40 @@ def test_missing_executables(preview_files):
     result = service.render("video")
     assert result.status is PreviewResultStatus.FAILED
     assert "FFprobe" in result.message
+
+
+def test_adjusted_render_uses_window_captions_and_v2_metadata(preview_files):
+    runner = FakeRunner(output_duration=4)
+    service = renderer(preview_files, runner)
+    result = service.render(
+        "video", render_start=0, render_end=4, timing_revision=1, force=True
+    )
+    assert result.status is PreviewResultStatus.SUCCESS
+    ffmpeg = next(command for command, _ in runner.commands if command[0] == "ffmpeg")
+    assert ffmpeg[ffmpeg.index("-ss") + 1] == "0.000"
+    assert ffmpeg[ffmpeg.index("-t") + 1] == "4.000"
+    metadata = json.loads(Path(result.metadata_path).read_text())
+    assert metadata["version"] == 2
+    assert metadata["candidate_start"] == 1
+    assert metadata["render_start"] == 0
+    assert metadata["render_end"] == 4
+    assert metadata["lead_in_seconds"] == 1
+    assert metadata["tail_seconds"] == 1
+    assert metadata["timing_revision"] == 1
+    events = service.generate_caption_events(
+        json.loads(preview_files[2].read_text()), 0, 10
+    )
+    assert "Outside" in " ".join(event.text for event in events)
+    assert "tail" in " ".join(event.text for event in events)
+
+
+def test_adjusted_range_validation_and_legacy_metadata(preview_files):
+    service = renderer(preview_files)
+    assert service.render("video", render_start=2, render_end=4).status is PreviewResultStatus.FAILED
+    assert service.render("video", render_start=-1, render_end=3).status is PreviewResultStatus.FAILED
+    output = service.output_directory / "video" / "one" / "preview.mp4"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"old")
+    metadata = output.with_name("preview.json")
+    metadata.write_text(json.dumps({"version": 1, "output_path": str(output.resolve())}))
+    assert service._valid_existing(output, metadata)

@@ -51,8 +51,11 @@ class FakeRenderer:
 
 
 class FakeQueue:
-    def __init__(self):
+    def __init__(self, existing=None):
         self.calls = []
+        self.existing = existing
+    def find_by_candidate(self, video_id, candidate_id):
+        return self.existing
     def add_or_update_preview(self, video_id, candidate, preview, metadata):
         self.calls.append((video_id, candidate, preview, metadata))
         return {"review_id": f"review-{candidate['rank']}"}
@@ -115,6 +118,18 @@ def test_verification_failure_not_added(tmp_path):
     renderer.render = bad
     result = batch.render("video", ranks=[1])
     assert result.failed == 1 and not queue.calls
+
+
+def test_existing_adjustment_is_used_for_forced_rerender(tmp_path):
+    batch, renderer, _ = setup(tmp_path, count=1)
+    queue = FakeQueue({
+        "render_start": 7.0, "render_end": 15.0, "timing_revision": 3,
+    })
+    batch.review_queue = queue
+    batch.render("video", force=True)
+    assert renderer.calls[0]["render_start"] == 7.0
+    assert renderer.calls[0]["render_end"] == 15.0
+    assert renderer.calls[0]["timing_revision"] == 3
 
 
 @pytest.mark.parametrize("mutation", [

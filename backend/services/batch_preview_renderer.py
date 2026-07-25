@@ -118,9 +118,20 @@ class BatchPreviewRenderer:
                 ))
                 continue
             try:
+                existing = (
+                    self.review_queue.find_by_candidate(video_id, candidate["candidate_id"])
+                    if hasattr(self.review_queue, "find_by_candidate") else None
+                )
+                timing = {}
+                if existing is not None:
+                    timing = {
+                        "render_start": existing["render_start"],
+                        "render_end": existing["render_end"],
+                        "timing_revision": existing["timing_revision"],
+                    }
                 rendered = self.renderer.render(
                     video_id, rank=rank, candidates_path=artifact_path,
-                    force=force, dry_run=dry_run,
+                    force=force, dry_run=dry_run, **timing,
                 )
             except (OSError, ValueError) as error:
                 results.append(BatchCandidateResult(
@@ -161,7 +172,7 @@ class BatchPreviewRenderer:
             raise ValueError("Preview metadata path does not exist.")
         with Path(metadata_path).open(encoding="utf-8") as stream:
             metadata = json.load(stream)
-        if not isinstance(metadata, dict) or metadata.get("version") != 1:
+        if not isinstance(metadata, dict) or metadata.get("version") not in (1, 2):
             raise ValueError("Preview metadata version is invalid.")
         if metadata.get("video_id") != video_id or metadata.get("candidate_id") != candidate_id:
             raise ValueError("Preview metadata identity does not match the candidate.")

@@ -31,7 +31,7 @@ def test_creates_queue_and_stable_identity(tmp_path):
 
 
 @pytest.mark.parametrize("change", [
-    lambda d: d.update(version=2),
+    lambda d: d.update(version=3),
     lambda d: d["items"][0].update(status="maybe"),
     lambda d: d["items"][0].update(created_at="yesterday"),
     lambda d: d["items"][0].update(candidate_score=101),
@@ -105,3 +105,73 @@ def test_atomic_replace_failure_cleans_temporary(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         add(queue)
     assert not list(tmp_path.glob(".reviews.*"))
+
+
+def test_version_one_migrates_atomically_and_preserves_review(tmp_path):
+    path = tmp_path / "reviews.json"
+    queue = ClipReviewQueue(path)
+    reviewed = queue.approve(add(queue)["review_id"], "keep this")
+    document = json.loads(path.read_text())
+    document["version"] = 1
+    timing = {
+        "render_start", "render_end", "render_duration", "lead_in_seconds",
+        "tail_seconds", "timing_revision", "timing_updated_at",
+    }
+    for field in timing:
+        document["items"][0].pop(field)
+    path.write_text(json.dumps(document))
+
+    migrated = ClipReviewQueue(path).find_by_review_id(reviewed["review_id"])
+    assert json.loads(path.read_text())["version"] == 2
+    assert migrated["status"] == "approved"
+    assert migrated["review_note"] == "keep this"
+    assert migrated["render_start"] == migrated["candidate_start"]
+    assert migrated["render_end"] == migrated["candidate_end"]
+    assert migrated["timing_revision"] == 0
+    assert not list(tmp_path.glob(".reviews.*"))
+
+
+@pytest.mark.parametrize("change", [
+    lambda item: item.update(render_start=-1),
+    lambda item: item.update(render_start=11),
+    lambda item: item.update(render_end=19),
+    lambda item: item.update(render_duration=99),
+    lambda item: item.update(lead_in_seconds=-1),
+    lambda item: item.update(tail_seconds=-1),
+    lambda item: item.update(timing_revision=-1),
+    lambda item: item.update(timing_revision=1.5),
+    lambda item: item.update(timing_updated_at="yesterday"),
+])
+def test_timing_validation(tmp_path, change):
+    path = tmp_path / "reviews.json"
+    add(ClipReviewQueue(path))
+    document = json.loads(path.read_text())
+    change(document["items"][0])
+    path.write_text(json.dumps(document))
+    with pytest.raises(ReviewQueueError):
+        ClipReviewQueue(path)
+
+
+def test_timing_update_preserves_candidate_and_note(tmp_path):
+    queue = ClipReviewQueue(tmp_path / "reviews.json")
+    original = queue.approve(add(queue)["review_id"], "keep")
+    updated = queue.update_timing(
+        original["review_id"], render_start=8, render_end=24,
+        preview_path="/tmp/new.mp4", preview_metadata_path="/tmp/new.json",
+    )
+    assert updated["candidate_start"] == 10
+    assert updated["candidate_end"] == 20
+    assert updated["candidate_score"] == original["candidate_score"]
+    assert updated["render_start"] == 8 and updated["render_end"] == 24
+    assert updated["lead_in_seconds"] == 2 and updated["tail_seconds"] == 4
+    assert updated["timing_revision"] == 1 and updated["timing_updated_at"]
+    assert updated["status"] == "pending" and updated["reviewed_at"] is None
+    assert updated["review_note"] == "keep"
+
+    rerun_candidate = candidate(score=12)
+    rerun_candidate.update(start=11, end=19, duration=8)
+    rerun = add(queue, rerun_candidate)
+    assert rerun["candidate_score"] == original["candidate_score"]
+    assert rerun["candidate_start"] == 10 and rerun["candidate_end"] == 20
+    assert rerun["render_start"] == 8 and rerun["render_end"] == 24
+    assert rerun["status"] == "pending" and rerun["review_note"] == "keep"

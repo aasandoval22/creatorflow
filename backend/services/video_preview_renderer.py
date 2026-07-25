@@ -187,13 +187,24 @@ class VideoPreviewRenderer:
         force: bool = False,
         dry_run: bool = False,
         output_path: Path | None = None,
+        render_start: float | None = None,
+        render_end: float | None = None,
+        clamp: bool = False,
+        timing_revision: int = 0,
     ) -> PreviewResult:
         try:
+            if (
+                isinstance(timing_revision, bool)
+                or not isinstance(timing_revision, int) or timing_revision < 0
+            ):
+                raise PreviewError("Timing revision must be a nonnegative integer.")
             context = self.prepare(
                 video_id, rank=rank, candidate_id=candidate_id,
                 candidates_path=candidates_path,
+                render_start=render_start, render_end=render_end, clamp=clamp,
             )
             candidate = context["candidate"]
+            window = context["render"]
             final_video, metadata_path = self._output_paths(
                 video_id, candidate["candidate_id"],
                 output_path or self.output_directory,
@@ -206,12 +217,12 @@ class VideoPreviewRenderer:
                 )
 
             events = self.generate_caption_events(
-                context["transcript"], candidate["start"], candidate["end"]
+                context["transcript"], window["start"], window["end"]
             ) if self.configuration.captions_enabled else []
             subtitle_placeholder = Path("<temporary-captions.ass>")
             temporary_video = final_video.with_name(f".{final_video.name}.render.tmp.mp4")
             command = self.build_ffmpeg_command(
-                context["media_path"], temporary_video, candidate,
+                context["media_path"], temporary_video, window,
                 context["source_probe"].has_audio,
                 subtitle_placeholder if self.configuration.captions_enabled else None,
             )
@@ -237,7 +248,7 @@ class VideoPreviewRenderer:
                         events, final_video.parent
                     )
                 command = self.build_ffmpeg_command(
-                    context["media_path"], temporary_video, candidate,
+                    context["media_path"], temporary_video, window,
                     context["source_probe"].has_audio, subtitle_path,
                 )
                 completed = self._run(command)
@@ -251,12 +262,12 @@ class VideoPreviewRenderer:
                     raise PreviewError("FFmpeg reported success but created no preview file.")
                 output_probe = self.probe_media(temporary_video)
                 self._validate_output_probe(
-                    output_probe, candidate["duration"],
+                    output_probe, window["duration"],
                     context["source_probe"].has_audio,
                 )
                 self._publish(
                     temporary_video, final_video, metadata_path,
-                    context, output_probe,
+                    context, output_probe, timing_revision,
                 )
             finally:
                 for temporary in (temporary_video, subtitle_path):
@@ -278,6 +289,9 @@ class VideoPreviewRenderer:
         rank: int | None = None,
         candidate_id: str | None = None,
         candidates_path: Path | None = None,
+        render_start: float | None = None,
+        render_end: float | None = None,
+        clamp: bool = False,
     ) -> dict[str, Any]:
         if rank is not None and candidate_id is not None:
             raise PreviewError("Candidate ID and rank are mutually exclusive.")
@@ -326,10 +340,26 @@ class VideoPreviewRenderer:
                 f"Candidate end {candidate['end']:.3f}s exceeds source duration "
                 f"{source_probe.duration:.3f}s."
             )
+        start = candidate["start"] if render_start is None else _number(render_start, "Render start")
+        end = candidate["end"] if render_end is None else _number(render_end, "Render end")
+        if start > candidate["start"] or end < candidate["end"]:
+            raise PreviewError("Adjusted render range must contain the entire original candidate.")
+        if start < 0 or end > source_probe.duration:
+            if not clamp:
+                raise PreviewError(
+                    f"Adjusted render range {start:.3f}-{end:.3f}s is outside source "
+                    f"duration 0-{source_probe.duration:.3f}s; use clamping explicitly."
+                )
+            start = max(0.0, start)
+            end = min(source_probe.duration, end)
+        if end <= start:
+            raise PreviewError("Adjusted render end must be greater than render start.")
+        render = {"start": start, "end": end, "duration": end - start}
         return {
             "record": record, "candidate": candidate, "transcript": transcript,
             "media_path": media_path, "transcript_path": transcript_path,
             "candidates_path": selected_candidates_path, "source_probe": source_probe,
+            "render": render,
         }
 
     def select_candidate(
@@ -607,20 +637,28 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     def _publish(
         self, temporary_video: Path, final_video: Path, metadata_path: Path,
-        context: dict[str, Any], probe: MediaProbe,
+        context: dict[str, Any], probe: MediaProbe, timing_revision: int = 0,
     ) -> None:
         candidate = context["candidate"]
+        render = context["render"]
         configuration = asdict(self.configuration)
         configuration.pop("pixel_format")
         metadata = {
-            "version": 1, "video_id": context["record"]["video_id"],
+            "version": 2, "video_id": context["record"]["video_id"],
             "candidate_id": candidate["candidate_id"],
             "candidate_rank": candidate["rank"],
             "source_media_path": str(context["media_path"]),
             "source_transcript_path": str(context["transcript_path"]),
             "source_candidates_path": str(context["candidates_path"]),
-            "start": round(candidate["start"], 3), "end": round(candidate["end"], 3),
-            "duration": round(candidate["duration"], 3),
+            "candidate_start": round(candidate["start"], 3),
+            "candidate_end": round(candidate["end"], 3),
+            "candidate_duration": round(candidate["duration"], 3),
+            "render_start": round(render["start"], 3),
+            "render_end": round(render["end"], 3),
+            "render_duration": round(render["duration"], 3),
+            "lead_in_seconds": round(candidate["start"] - render["start"], 3),
+            "tail_seconds": round(render["end"] - candidate["end"], 3),
+            "timing_revision": timing_revision,
             "output_path": str(final_video.resolve()), "created_at": utc_now(),
             "render_configuration": configuration,
             "caption_configuration": {
@@ -724,7 +762,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         try:
             document = self._read_json(metadata, "preview metadata")
             return (
-                document.get("version") == 1
+                document.get("version") in (1, 2)
                 and Path(document.get("output_path", "")).resolve() == video.resolve()
             )
         except (PreviewError, OSError):
@@ -735,9 +773,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         video: Path, metadata: Path, *, command: Sequence[str] = (), rendered: bool = False,
     ) -> PreviewResult:
         candidate = context["candidate"]
+        render = context["render"]
         return PreviewResult(
             status, message, context["record"]["video_id"],
-            candidate["candidate_id"], candidate["rank"], candidate["start"],
-            candidate["end"], candidate["duration"], str(video), str(metadata),
+            candidate["candidate_id"], candidate["rank"], render["start"],
+            render["end"], render["duration"], str(video), str(metadata),
             tuple(command), rendered,
         )
