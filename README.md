@@ -14,10 +14,12 @@ CreatorFlow is an AI-powered content clipping platform that automatically:
 # creatorflow
 
 
-## Offline tests
+## Testing
 
-Install the development dependencies, then run:
+The offline test suite runs automatically for pull requests targeting `main`
+and for pushes to `main`. To run the same suite locally using the existing
+Python virtual environment:
 
 ```bash
-pytest
+python -m pytest -p no:cacheprovider
 ```
