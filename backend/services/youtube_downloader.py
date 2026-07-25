@@ -12,6 +12,7 @@ from backend.services.video_manifest import (
     DEFAULT_MANIFEST_PATH,
     VideoManifest,
     VideoStatus,
+    default_transcription,
     utc_now,
 )
 
@@ -336,6 +337,7 @@ class YouTubeDownloader:
             "local_file_path": None,
             "status": VideoStatus.DISCOVERED.value,
             "error_message": None,
+            "transcription": default_transcription(),
         }
 
     @staticmethod

@@ -6,8 +6,10 @@ import pytest
 
 from backend.services.video_manifest import (
     ManifestError,
+    TranscriptionStatus,
     VideoManifest,
     VideoStatus,
+    default_transcription,
 )
 
 
@@ -27,6 +29,7 @@ def record(video_id="abc", status=VideoStatus.DISCOVERED.value):
         "local_file_path": None,
         "status": status,
         "error_message": None,
+        "transcription": default_transcription(),
     }
 
 
@@ -38,7 +41,7 @@ def test_creates_empty_manifest_and_parent_directory(tmp_path):
     assert path.exists()
     assert manifest.read_records() == []
     assert json.loads(path.read_text(encoding="utf-8")) == {
-        "version": 1,
+        "version": 2,
         "videos": [],
     }
 
@@ -116,7 +119,7 @@ def test_invalid_json_has_actionable_error(tmp_path):
         ([], "must be a JSON object"),
         ({"videos": []}, "exactly 'version' and 'videos'"),
         ({"version": 1, "videos": {}}, "'videos' must be a list"),
-        ({"version": 2, "videos": []}, "unsupported version"),
+        ({"version": 3, "videos": []}, "unsupported version"),
     ],
 )
 def test_rejects_incorrect_top_level_structure(
@@ -145,7 +148,7 @@ def test_rejects_incorrect_top_level_structure(
 def test_rejects_malformed_records(tmp_path, value, message):
     path = tmp_path / "videos.json"
     path.write_text(
-        json.dumps({"version": 1, "videos": [value]}), encoding="utf-8"
+        json.dumps({"version": 2, "videos": [value]}), encoding="utf-8"
     )
 
     with pytest.raises(ManifestError, match=message):
@@ -156,10 +159,130 @@ def test_rejects_invalid_status(tmp_path):
     path = tmp_path / "videos.json"
     path.write_text(
         json.dumps(
-            {"version": 1, "videos": [record(status="transcribing")]}
+            {"version": 2, "videos": [record(status="transcribing")]}
         ),
         encoding="utf-8",
     )
 
     with pytest.raises(ManifestError, match="invalid status"):
         VideoManifest(path)
+
+
+def test_migrates_version_one_atomically_and_preserves_records(tmp_path):
+    path = tmp_path / "videos.json"
+    old_record = record()
+    old_record.pop("transcription")
+    path.write_text(
+        json.dumps({"version": 1, "videos": [old_record]}),
+        encoding="utf-8",
+    )
+
+    manifest = VideoManifest(path)
+
+    saved = manifest.get("abc")
+    assert saved | {} == {**old_record, "transcription": default_transcription()}
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
+    assert list(tmp_path.glob(".videos.json.*.tmp")) == []
+    assert VideoManifest(path).get("abc") == saved
+
+
+def test_migration_failure_preserves_version_one_file(tmp_path):
+    path = tmp_path / "videos.json"
+    old_record = record()
+    old_record.pop("transcription")
+    original = json.dumps({"version": 1, "videos": [old_record]})
+    path.write_text(original, encoding="utf-8")
+
+    with patch(
+        "backend.services.video_manifest.os.replace",
+        side_effect=OSError("replace failed"),
+    ):
+        with pytest.raises(OSError, match="replace failed"):
+            VideoManifest(path)
+
+    assert path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".videos.json.*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    ("transcription", "message"),
+    [
+        (None, "must be an object"),
+        ({}, "structure is malformed"),
+        (
+            {**default_transcription(), "status": "unknown"},
+            "invalid transcription status",
+        ),
+        (
+            {**default_transcription(), "transcript_json_path": 5},
+            "must be a string or null",
+        ),
+        (
+            {**default_transcription(), "started_at": "yesterday"},
+            "ISO 8601",
+        ),
+        (
+            {
+                **default_transcription(),
+                "completed_at": "2026-07-24T12:00:00",
+            },
+            "must use UTC",
+        ),
+    ],
+)
+def test_rejects_invalid_transcription(tmp_path, transcription, message):
+    path = tmp_path / "videos.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "videos": [{**record(), "transcription": transcription}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestError, match=message):
+        VideoManifest(path)
+
+
+def test_rediscovery_preserves_completed_transcription(tmp_path):
+    manifest = VideoManifest(tmp_path / "videos.json")
+    manifest.upsert(record())
+    manifest.update_transcription(
+        "abc",
+        status=TranscriptionStatus.COMPLETED.value,
+        model="base.en",
+        language="en",
+        started_at="2026-07-24T12:01:00+00:00",
+        completed_at="2026-07-24T12:02:00+00:00",
+        transcript_json_path="/tmp/transcript.json",
+        transcript_text_path="/tmp/transcript.txt",
+        subtitle_srt_path="/tmp/subtitles.srt",
+    )
+    rediscovered = record()
+    rediscovered["title"] = "Updated title"
+
+    saved = manifest.upsert(rediscovered)
+
+    assert saved["title"] == "Updated title"
+    assert saved["transcription"]["status"] == "completed"
+    assert saved["transcription"]["transcript_json_path"].endswith(
+        "transcript.json"
+    )
+
+
+def test_transcription_update_preserves_video_metadata(tmp_path):
+    manifest = VideoManifest(tmp_path / "videos.json")
+    original = manifest.upsert(record())
+
+    updated = manifest.update_transcription(
+        "abc",
+        status=TranscriptionStatus.PROCESSING.value,
+        started_at="2026-07-24T12:01:00+00:00",
+    )
+
+    assert {key: updated[key] for key in original if key != "transcription"} == {
+        key: original[key] for key in original if key != "transcription"
+    }
+    assert updated["transcription"]["status"] == "processing"
