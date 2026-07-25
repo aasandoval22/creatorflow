@@ -1,3 +1,6 @@
+import os
+import shutil
+import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
@@ -21,6 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOWNLOAD_DIRECTORY = PROJECT_ROOT / "data" / "downloads"
 ARCHIVE_DIRECTORY = PROJECT_ROOT / "data" / "database"
 DOWNLOAD_ARCHIVE = ARCHIVE_DIRECTORY / "downloaded_videos.txt"
+DEFAULT_DENO_PATH = Path.home() / ".deno" / "bin" / "deno"
 
 
 class DownloadStatus(str, Enum):
@@ -48,6 +52,26 @@ class ChannelDiscoveryResult:
     message: str
 
 
+def find_deno_executable(explicit_path: Path | str | None = None) -> Path | None:
+    """Return an executable Deno path without relying solely on shell PATH."""
+
+    configured = os.environ.get("AUTOCLIP_DENO_PATH")
+    if explicit_path is not None:
+        candidates = [Path(explicit_path).expanduser()]
+    else:
+        candidates = []
+        if configured:
+            candidates.append(Path(configured).expanduser())
+        candidates.append(DEFAULT_DENO_PATH)
+        if found := shutil.which("deno"):
+            candidates.append(Path(found))
+    for candidate in candidates:
+        absolute = Path(os.path.abspath(candidate))
+        if absolute.is_file() and os.access(absolute, os.X_OK):
+            return absolute
+    return None
+
+
 class YouTubeDownloader:
     """Discover and download YouTube videos with structured tracking."""
 
@@ -59,11 +83,22 @@ class YouTubeDownloader:
         manifest: VideoManifest | None = None,
         *,
         discovery_only: bool = False,
+        deno_path: Path | str | None = None,
     ) -> None:
         self.download_directory = Path(download_directory)
         self.archive_directory = Path(archive_directory)
         self.download_archive = self.archive_directory / DOWNLOAD_ARCHIVE.name
         self.discovery_only = discovery_only
+        self.deno_path = find_deno_executable(deno_path)
+        if self.deno_path is None:
+            warnings.warn(
+                "Deno JavaScript runtime was not found. yt-dlp will continue "
+                "without an explicitly configured JavaScript runtime; some "
+                "YouTube formats may be unavailable. Set AUTOCLIP_DENO_PATH "
+                "or install Deno at ~/.deno/bin/deno.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if not discovery_only:
             self.download_directory.mkdir(parents=True, exist_ok=True)
             self.archive_directory.mkdir(parents=True, exist_ok=True)
@@ -85,19 +120,29 @@ class YouTubeDownloader:
             "restrictfilenames": True,
             "download_archive": str(self.download_archive),
             "ignoreerrors": False,
+            **self._runtime_options(),
         }
 
-    @staticmethod
-    def _metadata_options(max_videos: int | None = None) -> dict[str, Any]:
+    def _metadata_options(self, max_videos: int | None = None) -> dict[str, Any]:
         options: dict[str, Any] = {
             "skip_download": True,
             "quiet": True,
             "ignoreerrors": False,
+            **self._runtime_options(),
         }
         if max_videos is not None:
             options["playlistend"] = max_videos
             options["lazy_playlist"] = True
         return options
+
+    def _runtime_options(self) -> dict[str, Any]:
+        if self.deno_path is None:
+            return {}
+        return {
+            "js_runtimes": {
+                "deno": {"path": str(self.deno_path)},
+            },
+        }
 
     def download_video(self, video_url: str) -> DownloadResult:
         """Discover metadata and download one video URL."""
