@@ -230,6 +230,7 @@ def test_status_and_health_reporting(tmp_path):
     assert status["most_recent_failure"] == "2026-07-25T20:30:00Z"
     assert status["processing_state_updated_at"] == "2026-07-25T20:30:01Z"
     assert status["awaiting_review"] == 1
+    assert status["deployment"]["deployed_commit"] is None
 
 
 def test_status_handles_missing_or_malformed_runtime_files(tmp_path):
