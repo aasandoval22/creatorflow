@@ -104,26 +104,53 @@ platform.
 ## Unattended production services
 
 CreatorFlow includes repository-managed systemd user units for the loopback
-review server and scheduled production runner. Install the units for the
-current repository checkout:
+review server and scheduled production runner. Live services run from an
+isolated, versioned production release, never from the development checkout.
+Deploy only from a clean local `main` that exactly matches `origin/main`:
 
 ```bash
-.venv/bin/python -m backend.services.autoclip_service install
+.venv/bin/python -m backend.services.autoclip_service deploy
 ```
 
-Installation renders the tracked templates in `deploy/systemd/` into
-`~/.config/systemd/user/` using absolute paths to this repository and its
-virtual environment. It is atomic and idempotent: rerunning it updates the
-same three unit files without creating duplicate services or timers. It also
-creates `~/.config/creatorflow/creatorflow.env` with mode `0600` if that local
-configuration file does not exist. Existing environment-file content is never
-overwritten.
+The deployment command fetches `origin`, refuses dirty or non-`main`
+development checkouts, and requires local `HEAD` to equal `origin/main`. It
+prepares a detached release at
+`~/clip-factory-production/releases/<full-commit>/`, creates that release's
+own `.venv`, installs the production and transcription requirements, runs the
+complete offline test suite from the release, checks the existing Deno
+runtime, and atomically updates `~/clip-factory-production/current`.
+
+Generated systemd units in `~/.config/systemd/user/` use only:
+
+```text
+WorkingDirectory=/home/aasandoval/clip-factory-production/current
+ExecStart=/home/aasandoval/clip-factory-production/current/.venv/bin/python ...
+EnvironmentFile=-/home/aasandoval/.config/creatorflow/creatorflow.env
+```
+
+No unit path points into `/home/aasandoval/clip-factory`. The environment file
+must already exist with mode `0600`; deployment preserves its exact contents.
+The review server remains explicitly bound to `127.0.0.1`.
+
+On the first deployment, the existing ignored `data/` tree is atomically moved
+to `~/.local/share/creatorflow/data`, and both development and every release
+use a symlink to that persistent location. Downloads, transcripts, candidates,
+previews, decisions, processing state, references, profiles, comparisons, and
+logs therefore survive release replacement and rollback. No generated data,
+environment file, release, or virtual environment belongs in Git.
+
+Deployment records the active and previous commits in
+`~/clip-factory-production/deployment.json`. Repeating deployment of the same
+commit reuses and revalidates the exact release. A release or dependency
+validation failure leaves the previous `current` target unchanged. Services
+that were stopped remain stopped; only services active before activation are
+restarted and health-checked.
 
 The default production interval is 30 minutes. Set another positive systemd
-duration during installation without editing Python source:
+duration during deployment without editing Python source:
 
 ```bash
-.venv/bin/python -m backend.services.autoclip_service install --interval 2h
+.venv/bin/python -m backend.services.autoclip_service deploy --interval 2h
 ```
 
 Optional production-runner and review-server arguments belong in the local
@@ -149,6 +176,8 @@ requires them for some separately managed dependency.
 Manage the services with one entry point:
 
 ```bash
+.venv/bin/python -m backend.services.autoclip_service deploy
+.venv/bin/python -m backend.services.autoclip_service rollback
 .venv/bin/python -m backend.services.autoclip_service start
 .venv/bin/python -m backend.services.autoclip_service stop
 .venv/bin/python -m backend.services.autoclip_service restart
@@ -158,6 +187,11 @@ Manage the services with one entry point:
 .venv/bin/python -m backend.services.autoclip_service run-now
 .venv/bin/python -m backend.services.autoclip_service disable
 ```
+
+`rollback` validates and atomically selects the previously recorded release,
+then restarts only services that were active. It swaps the current and previous
+commit records, so a second rollback returns to the release that was active
+before it.
 
 `start` enables and starts the review service and production timer. The review
 service uses `Restart=on-failure` with a five-second delay. The timer waits five
@@ -169,7 +203,8 @@ review server unchanged.
 and manual service runs retain `production_runner`'s nonblocking file lock, so
 they cannot overlap.
 
-`status` reports the review service and production timer states, the next timer
+`status` reports the deployed commit, current `origin/main` commit, whether
+production is behind main, review service and timer states, the next timer
 event, the latest systemd production result, the most recent successful and
 failed timestamps found in `data/logs/production.jsonl`, the processing-state
 update time, the number of pending review items, and user-lingering status.
@@ -190,6 +225,22 @@ Without lingering, the enabled units start when the user logs in rather than
 unattended at boot. No service in this layer publishes clips, changes selection
 or rendering behavior, exposes the review server publicly, or modifies SSH,
 UFW, WireGuard, router, or Cloudflare configuration.
+
+Pushing a branch never deploys it. After a deployment-isolation change is
+merged and local `main` is fast-forwarded, migrate the stopped live services
+with:
+
+```bash
+git switch main
+git pull --ff-only origin main
+.venv/bin/python -m pytest -p no:cacheprovider
+.venv/bin/python -m backend.services.autoclip_service deploy
+.venv/bin/python -m backend.services.autoclip_service status
+.venv/bin/python -m backend.services.autoclip_service start
+```
+
+Inspect the generated units and status before the final `start`. Deployment
+itself does not enable stopped units.
 
 ## Local transcription
 
