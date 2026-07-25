@@ -98,9 +98,9 @@ decode real media, or perform real transcription.
 
 ## Transcript clip-candidate analysis
 
-CreatorFlow's local workflow is ingestion → transcription → candidate analysis
-→ batch preview rendering → local human review → timing correction and
-re-review. Analyze all eligible downloaded videos with
+CreatorFlow's current local workflow is ingestion → transcription → candidate
+analysis → batch preview rendering → interactive local review → timing
+correction when needed. Analyze all eligible downloaded videos with
 completed transcripts:
 
 ```bash
@@ -196,9 +196,38 @@ python -m backend.app.review_clips build-index
 python -m http.server 8080 --directory data
 ```
 
-The server command is optional and must be started intentionally; the review
-command never starts a server. Approval is local review state only. It does not
-upload, schedule, or publish a clip anywhere.
+This static index can be viewed through `python -m http.server`, but its cards
+are read-only. For decisions, notes, and timing controls, intentionally start
+the interactive standard-library server:
+
+```bash
+python -m backend.app.review_server
+```
+
+Open `http://127.0.0.1:8080/`. Each card can approve or reject a clip with a
+note, return it to pending, rerender relative or absolute timing, or reset the
+preview to its immutable candidate timing. Rerendering is synchronous and may
+take some time; a successful replacement returns the clip to pending review.
+These controls reuse the same queue and timing-adjustment services as the CLI.
+The CLI and static index remain available.
+
+The interactive server binds to `127.0.0.1` by default and never starts
+automatically. Keep it loopback-bound. To review on a remote machine, create an
+SSH tunnel and then use the same browser URL locally:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@server
+```
+
+Do not bind this administrative page publicly. `--allow-non-loopback` exists
+only for an explicitly secured environment and prints a strong warning. The
+random per-process form token protects local write requests, but it is not
+authentication and is not a substitute for loopback isolation or an SSH
+tunnel. The page loads no external resources and the server performs no
+external network requests.
+
+Approval is local review state only. Neither the interactive page, the CLI,
+nor the static index uploads, schedules, or publishes a clip anywhere.
 
 ### Review-time timing correction
 

@@ -8,9 +8,16 @@ import json
 import math
 import os
 import tempfile
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
 
 from backend.services.video_manifest import utc_now
 
@@ -59,14 +66,55 @@ def _number(value: Any, label: str) -> float:
 class ClipReviewQueue:
     """Read and atomically update a strictly validated review queue."""
 
-    def __init__(self, path: Path = DEFAULT_REVIEW_QUEUE_PATH) -> None:
+    _registry_guard = threading.Lock()
+    _process_locks: dict[Path, threading.RLock] = {}
+    _local = threading.local()
+
+    def __init__(
+        self, path: Path = DEFAULT_REVIEW_QUEUE_PATH, *,
+        process_lock: threading.RLock | None = None,
+    ) -> None:
         self.path = Path(path)
-        if self.path.exists():
-            document = self._read_document()
-            if document.get("version") == 1:
-                document = self._migrate_v1(document)
-                self._write_document(document)
-            self._validate_document(document)
+        self.lock_path = self.path.with_name(f"{self.path.name}.lock")
+        if process_lock is None:
+            key = self.path.resolve()
+            with self._registry_guard:
+                process_lock = self._process_locks.setdefault(key, threading.RLock())
+        self._process_lock = process_lock
+        with self.locked():
+            if self.path.exists():
+                document = self._read_document()
+                if document.get("version") == 1:
+                    document = self._migrate_v1(document)
+                    self._write_document(document)
+                self._validate_document(document)
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        """Serialize a complete queue transaction in-process and across processes."""
+        with self._process_lock:
+            key = str(self.path.resolve())
+            depths = getattr(self._local, "depths", {})
+            depth = depths.get(key, 0)
+            lock_stream = None
+            try:
+                if depth == 0 and fcntl is not None:
+                    self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+                    lock_stream = self.lock_path.open("a+b")
+                    fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+                depths[key] = depth + 1
+                self._local.depths = depths
+                yield
+            finally:
+                if depth == 0:
+                    depths.pop(key, None)
+                    if lock_stream is not None:
+                        try:
+                            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+                        finally:
+                            lock_stream.close()
+                else:
+                    depths[key] = depth
 
     def _migrate_v1(self, document: dict[str, Any]) -> dict[str, Any]:
         if set(document) != {"version", "updated_at", "items"} or not isinstance(
@@ -217,7 +265,8 @@ class ClipReviewQueue:
     ) -> list[dict[str, Any]]:
         if status is not None and status not in REVIEW_STATUSES:
             raise ReviewQueueError(f"Unknown review status {status!r}.")
-        items = self._load()["items"]
+        with self.locked():
+            items = self._load()["items"]
         selected = [
             item for item in items
             if (status is None or item["status"] == status)
@@ -235,6 +284,15 @@ class ClipReviewQueue:
         ), None)
 
     def add_or_update_preview(
+        self, video_id: str, candidate: dict[str, Any],
+        preview_path: str | Path, preview_metadata_path: str | Path,
+    ) -> dict[str, Any]:
+        with self.locked():
+            return self._add_or_update_preview(
+                video_id, candidate, preview_path, preview_metadata_path
+            )
+
+    def _add_or_update_preview(
         self, video_id: str, candidate: dict[str, Any],
         preview_path: str | Path, preview_metadata_path: str | Path,
     ) -> dict[str, Any]:
@@ -291,6 +349,18 @@ class ClipReviewQueue:
         preview_path: str | Path, preview_metadata_path: str | Path,
         note: str | None = None, clear_note: bool = False,
     ) -> dict[str, Any]:
+        with self.locked():
+            return self._update_timing(
+                review_id, render_start=render_start, render_end=render_end,
+                preview_path=preview_path, preview_metadata_path=preview_metadata_path,
+                note=note, clear_note=clear_note,
+            )
+
+    def _update_timing(
+        self, review_id: str, *, render_start: float, render_end: float,
+        preview_path: str | Path, preview_metadata_path: str | Path,
+        note: str | None = None, clear_note: bool = False,
+    ) -> dict[str, Any]:
         if note is not None and clear_note:
             raise ReviewQueueError("A note and clear_note cannot be used together.")
         document = self._load()
@@ -323,24 +393,25 @@ class ClipReviewQueue:
         self, review_id: str, *, status: str | None = None,
         note: str | None = None, change_note: bool = False,
     ) -> dict[str, Any]:
-        document = self._load()
-        item = next((value for value in document["items"] if value["review_id"] == review_id), None)
-        if item is None:
-            raise ReviewQueueError(f"Review ID {review_id!r} was not found.")
-        now = utc_now()
-        if status is not None:
-            if status not in REVIEW_STATUSES:
-                raise ReviewQueueError(f"Unknown review status {status!r}.")
-            item["status"] = status
-            item["reviewed_at"] = None if status == "pending" else now
-        if change_note:
-            if note is not None and not isinstance(note, str):
-                raise ReviewQueueError("Review note must be a string or null.")
-            item["review_note"] = note
-        item["updated_at"] = now
-        document["updated_at"] = now
-        self._write_document(document)
-        return copy.deepcopy(item)
+        with self.locked():
+            document = self._load()
+            item = next((value for value in document["items"] if value["review_id"] == review_id), None)
+            if item is None:
+                raise ReviewQueueError(f"Review ID {review_id!r} was not found.")
+            now = utc_now()
+            if status is not None:
+                if status not in REVIEW_STATUSES:
+                    raise ReviewQueueError(f"Unknown review status {status!r}.")
+                item["status"] = status
+                item["reviewed_at"] = None if status == "pending" else now
+            if change_note:
+                if note is not None and not isinstance(note, str):
+                    raise ReviewQueueError("Review note must be a string or null.")
+                item["review_note"] = note
+            item["updated_at"] = now
+            document["updated_at"] = now
+            self._write_document(document)
+            return copy.deepcopy(item)
 
     def approve(self, review_id: str, note: str | None = None) -> dict[str, Any]:
         return self._change(review_id, status="approved", note=note, change_note=note is not None)
