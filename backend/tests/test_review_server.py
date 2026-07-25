@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import io
+import json
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -166,9 +167,68 @@ def test_index_metadata_escaping_forms_and_no_external_resources(tmp_path):
     for label in ("Original candidate", "Current render", "Timing revision",
                   "Preview metadata path", "Review note", "Lead-in", "Tail"):
         assert label in text
-        assert text.count('name="form_token" value="test-token"') == 4
+        assert text.count('name="form_token" value="test-token"') == 5
     assert "autoplay" not in text and "https://" not in text and "<script" not in text
     assert f"/media/{item['review_id']}" in text
+    assert "Compare to Reference Profile" in text
+
+
+class FakeComparator:
+    def __init__(self, root: Path, *, fail: bool = False):
+        self.root = root
+        self.fail = fail
+
+    def report_path(self, profile, review_id):
+        return self.root / profile / f"{review_id}.json"
+
+    def compare(self, profile, item, *, write=False):
+        if self.fail:
+            raise ValueError("synthetic comparison failure")
+        report = {
+            "review_id": item["review_id"], "profile_name": profile,
+            "profile_confidence": "provisional", "findings": {
+                name: {"status": "known", "evidence": f"{name} evidence"}
+                for name in ("duration_fit", "opening_context", "payoff_completion",
+                             "ending_tail", "layout")
+            },
+        }
+        if write:
+            path = self.report_path(profile, item["review_id"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(report), encoding="utf-8")
+        return report
+
+
+def test_reference_comparison_post_preserves_review_state_and_displays_report(tmp_path):
+    with running_server(tmp_path) as (server, queue, _):
+        server.app.reference_comparator = FakeComparator(tmp_path / "comparisons")
+        rid = review_id(queue)
+        before = queue.find_by_review_id(rid)
+        status, headers, _ = post(
+            server, f"/reviews/{rid}/compare-reference",
+            {"form_token": "test-token"},
+        )
+        after = queue.find_by_review_id(rid)
+        _, _, body = request(server, "GET", "/")
+    assert status == 303 and "compared+locally" in headers["Location"]
+    assert before == after
+    text = body.decode()
+    assert "personality_reaction" in text and "provisional" in text
+    assert "duration_fit evidence" in text
+
+
+def test_failed_reference_comparison_preserves_review_state(tmp_path):
+    with running_server(tmp_path) as (server, queue, _):
+        server.app.reference_comparator = FakeComparator(tmp_path, fail=True)
+        rid = review_id(queue)
+        before = queue.find_by_review_id(rid)
+        status, headers, _ = post(
+            server, f"/reviews/{rid}/compare-reference",
+            {"form_token": "test-token"},
+        )
+        after = queue.find_by_review_id(rid)
+    assert status == 303 and "error=" in headers["Location"]
+    assert before == after
 
 
 def test_sections_sort_and_filters(tmp_path):

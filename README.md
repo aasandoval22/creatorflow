@@ -254,6 +254,58 @@ external network requests.
 Approval is local review state only. Neither the interactive page, the CLI,
 nor the static index uploads, schedules, or publishes a clip anywhere.
 
+## Accepted clip references
+
+Accepted references describe clips that a user considers publishable. They are
+deterministic quality and style references—not machine-learning training
+samples, and not proof that future clips should copy one duration or structure.
+They help inspect whether a preview enters at the earliest comprehensible
+moment, preserves the complete story beat and personality reaction, reaches its
+payoff, and stops without unnecessary tail.
+
+Register the existing local reference, analyze it, and build its initial
+profile:
+
+```bash
+python -m backend.app.reference_clips register \
+  --reference-directory data/reference_clips/6j_BQCxHn74 \
+  --profile personality_reaction
+python -m backend.app.reference_clips analyze youtube-6j_BQCxHn74
+python -m backend.app.reference_clips build-profile personality_reaction
+```
+
+Analysis uses local FFprobe and FFmpeg plus the existing optional
+faster-whisper runtime. Use `--no-transcription` when only media, scene-change,
+and silence measurements are wanted. Scene changes are pixel-change signals,
+and transcript reaction/payoff findings are heuristics; neither proves humor or
+quality.
+
+Compare rejected previews for a video:
+
+```bash
+python -m backend.app.reference_clips compare \
+  --profile personality_reaction --video-id hhQzg7Him1g --status rejected
+```
+
+The interactive review page also offers **Compare to Reference Profile**. It
+writes a local report and leaves decisions, notes, timing, and previews
+unchanged. The report separates known measurements, heuristic findings, and
+unavailable evidence.
+
+One accepted reference produces a `provisional` profile because one example
+does not establish statistical confidence. Add later accepted references in
+their own directories with `reference.mp4` and `baseline.json`, register and
+analyze them, then rebuild the profile to use medians and observed ranges.
+Profiles remain soft priors and never change candidate selection or rendering
+defaults automatically.
+
+Reference media, annotations, source metadata, analyses, profiles, analyzer
+temporary files, and comparison reports stay under ignored `data/` paths.
+These commands perform no downloading, uploading, publishing, or platform
+access. The current workflow is ingestion → transcription → candidate analysis
+→ preview rendering → local review → accepted-reference comparison → human
+timing/decision changes when warranted.
+
 ### Review-time timing correction
 
 Transcript boundaries are useful for finding a spoken moment, but visual
