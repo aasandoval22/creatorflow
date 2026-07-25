@@ -58,6 +58,49 @@ video ID. A `discovered` record has metadata but no confirmed local media;
 already contains it; and `failed` includes an error message for a failed
 ingestion attempt.
 
+## Manual production cycle
+
+Run one dependable ingestion-to-review cycle for every enabled creator:
+
+```bash
+.venv/bin/python -m backend.services.production_runner
+```
+
+Preview discovery and the planned work without downloading, transcribing,
+rendering, changing the manifest/review queue/production state, or writing a
+production log:
+
+```bash
+.venv/bin/python -m backend.services.production_runner --dry-run
+```
+
+The command reuses the existing channel configuration, YouTube downloader,
+manifest, faster-whisper transcription, deterministic candidate analysis,
+reaction-context preview renderer, and review queue. The current defaults
+inspect three recent videos per enabled creator and render the top three
+candidates. Use `--max-videos` and `--top` to set explicit per-run limits.
+
+Durable orchestration state is stored at
+`data/production/processing_state.json`. Version 1 contains an `updated_at`
+timestamp and a `videos` object keyed by stable source video ID. Each video
+records its creator, status, current stage, attempt count, first-seen/update/
+completion timestamps, last error, and review-preview count. Writes are atomic.
+Completed IDs and existing review-queue items are deduplicated on later runs.
+Failed work is retried, and a `processing` entry left by interruption is marked
+interrupted before recovery resumes.
+
+`data/production/production.lock` uses a nonblocking process lock, so a second
+production cycle exits instead of overlapping the active run. JSON-line events
+are printed during every run and real runs are also appended to
+`data/logs/production.jsonl`. Creator and video failures are isolated and
+included in the final structured summary. Generated state, lock files, logs,
+downloads, transcripts, candidates, previews, and review data are ignored by
+Git.
+
+This command is manually invoked. It does not install a scheduler, start the
+review server, upload media, or publish to YouTube, TikTok, or any other
+platform.
+
 ## Local transcription
 
 Install the optional transcription runtime separately from development
