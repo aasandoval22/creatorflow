@@ -42,3 +42,27 @@ def test_index_escaping_relative_paths_and_empty(tmp_path):
         "--review-queue-path", str(empty), "build-index", "--output-path", str(empty_index)
     ]) == 0
     assert empty_index.read_text().count("No clips.") == 3
+
+
+def test_list_show_and_index_display_adjusted_timing(tmp_path, capsys):
+    path = tmp_path / "reviews.json"
+    queue = ClipReviewQueue(path)
+    review = item(queue)
+    queue.update_timing(
+        review["review_id"], render_start=0, render_end=6,
+        preview_path=review["preview_path"],
+        preview_metadata_path=review["preview_metadata_path"],
+    )
+    assert review_clips.main(["--review-queue-path", str(path), "list"]) == 0
+    assert "ADJUSTED 6.00s" in capsys.readouterr().out
+    assert review_clips.main([
+        "--review-queue-path", str(path), "show", review["review_id"]
+    ]) == 0
+    shown = capsys.readouterr().out
+    assert "Original candidate: 1.000-4.000" in shown
+    assert "Current render: 0.000-6.000" in shown
+    output = tmp_path / "index.html"
+    review_clips.build_index(queue, output)
+    document = output.read_text()
+    assert "Timing adjusted" in document
+    assert "Original candidate:" in document and "Render range:" in document

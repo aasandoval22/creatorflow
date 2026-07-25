@@ -17,7 +17,7 @@ from backend.services.video_manifest import utc_now
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REVIEW_QUEUE_PATH = PROJECT_ROOT / "data" / "review_queue" / "reviews.json"
-REVIEW_QUEUE_VERSION = 1
+REVIEW_QUEUE_VERSION = 2
 REVIEW_STATUSES = frozenset({"pending", "approved", "rejected"})
 ITEM_FIELDS = {
     "review_id", "video_id", "candidate_id", "candidate_rank",
@@ -25,6 +25,8 @@ ITEM_FIELDS = {
     "candidate_duration", "candidate_text", "preview_path",
     "preview_metadata_path", "status", "reviewed_at", "review_note",
     "created_at", "updated_at",
+    "render_start", "render_end", "render_duration", "lead_in_seconds",
+    "tail_seconds", "timing_revision", "timing_updated_at",
 }
 
 
@@ -60,7 +62,33 @@ class ClipReviewQueue:
     def __init__(self, path: Path = DEFAULT_REVIEW_QUEUE_PATH) -> None:
         self.path = Path(path)
         if self.path.exists():
-            self._validate_document(self._read_document())
+            document = self._read_document()
+            if document.get("version") == 1:
+                document = self._migrate_v1(document)
+                self._write_document(document)
+            self._validate_document(document)
+
+    def _migrate_v1(self, document: dict[str, Any]) -> dict[str, Any]:
+        if set(document) != {"version", "updated_at", "items"} or not isinstance(
+            document.get("items"), list
+        ):
+            raise ReviewQueueError("Version 1 review queue has an invalid structure.")
+        migrated = copy.deepcopy(document)
+        migrated["version"] = REVIEW_QUEUE_VERSION
+        for item in migrated["items"]:
+            if not isinstance(item, dict):
+                raise ReviewQueueError("Version 1 review queue contains an invalid item.")
+            item.update(
+                render_start=item.get("candidate_start"),
+                render_end=item.get("candidate_end"),
+                render_duration=item.get("candidate_duration"),
+                lead_in_seconds=0.0,
+                tail_seconds=0.0,
+                timing_revision=0,
+                timing_updated_at=None,
+            )
+        self._validate_document(migrated)
+        return migrated
 
     @staticmethod
     def stable_review_id(video_id: str, candidate_id: str) -> str:
@@ -132,6 +160,25 @@ class ClipReviewQueue:
         duration = _number(item["candidate_duration"], f"{label} candidate_duration")
         if start < 0 or end <= start or duration <= 0 or abs(duration - (end - start)) > 0.1:
             raise ReviewQueueError(f"{label} candidate timestamps and duration are invalid.")
+        render_start = _number(item["render_start"], f"{label} render_start")
+        render_end = _number(item["render_end"], f"{label} render_end")
+        render_duration = _number(item["render_duration"], f"{label} render_duration")
+        lead = _number(item["lead_in_seconds"], f"{label} lead_in_seconds")
+        tail = _number(item["tail_seconds"], f"{label} tail_seconds")
+        if lead < 0 or tail < 0:
+            raise ReviewQueueError(f"{label} lead-in and tail must be nonnegative.")
+        if (
+            render_start < 0 or render_end <= render_start
+            or render_start > start or render_end < end
+            or abs(render_duration - (render_end - render_start)) > 0.1
+        ):
+            raise ReviewQueueError(f"{label} render timestamps and duration are invalid.")
+        if abs(lead - (start - render_start)) > 0.1 or abs(tail - (render_end - end)) > 0.1:
+            raise ReviewQueueError(f"{label} lead-in or tail disagrees with the render range.")
+        revision = item["timing_revision"]
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ReviewQueueError(f"{label} timing_revision must be a nonnegative integer.")
+        _timestamp(item["timing_updated_at"], f"{label} timing_updated_at", nullable=True)
         status = item["status"]
         if status not in REVIEW_STATUSES:
             raise ReviewQueueError(f"{label} status must be pending, approved, or rejected.")
@@ -204,16 +251,24 @@ class ClipReviewQueue:
             if (item["video_id"], item["candidate_id"]) == identity
         ), None)
         preserved = existing or {}
+        preserve_candidate = bool(existing and existing.get("timing_revision", 0) > 0)
         item = {
             "review_id": self.stable_review_id(*identity),
             "video_id": video_id,
             "candidate_id": candidate_id,
-            "candidate_rank": candidate.get("rank"),
-            "candidate_score": candidate.get("score"),
-            "candidate_start": candidate.get("start"),
-            "candidate_end": candidate.get("end"),
-            "candidate_duration": candidate.get("duration"),
-            "candidate_text": candidate.get("text"),
+            "candidate_rank": preserved["candidate_rank"] if preserve_candidate else candidate.get("rank"),
+            "candidate_score": preserved["candidate_score"] if preserve_candidate else candidate.get("score"),
+            "candidate_start": preserved["candidate_start"] if preserve_candidate else candidate.get("start"),
+            "candidate_end": preserved["candidate_end"] if preserve_candidate else candidate.get("end"),
+            "candidate_duration": preserved["candidate_duration"] if preserve_candidate else candidate.get("duration"),
+            "candidate_text": preserved["candidate_text"] if preserve_candidate else candidate.get("text"),
+            "render_start": preserved["render_start"] if preserve_candidate else candidate.get("start"),
+            "render_end": preserved["render_end"] if preserve_candidate else candidate.get("end"),
+            "render_duration": preserved["render_duration"] if preserve_candidate else candidate.get("duration"),
+            "lead_in_seconds": preserved["lead_in_seconds"] if preserve_candidate else 0.0,
+            "tail_seconds": preserved["tail_seconds"] if preserve_candidate else 0.0,
+            "timing_revision": preserved.get("timing_revision", 0),
+            "timing_updated_at": preserved.get("timing_updated_at"),
             "preview_path": str(preview_path),
             "preview_metadata_path": str(preview_metadata_path),
             "status": preserved.get("status", "pending"),
@@ -227,6 +282,39 @@ class ClipReviewQueue:
             document["items"].append(item)
         else:
             document["items"][document["items"].index(existing)] = item
+        document["updated_at"] = now
+        self._write_document(document)
+        return copy.deepcopy(item)
+
+    def update_timing(
+        self, review_id: str, *, render_start: float, render_end: float,
+        preview_path: str | Path, preview_metadata_path: str | Path,
+        note: str | None = None, clear_note: bool = False,
+    ) -> dict[str, Any]:
+        if note is not None and clear_note:
+            raise ReviewQueueError("A note and clear_note cannot be used together.")
+        document = self._load()
+        item = next((value for value in document["items"] if value["review_id"] == review_id), None)
+        if item is None:
+            raise ReviewQueueError(f"Review ID {review_id!r} was not found.")
+        now = utc_now()
+        start = round(float(render_start), 3)
+        end = round(float(render_end), 3)
+        item.update(
+            render_start=start, render_end=end,
+            render_duration=round(end - start, 3),
+            lead_in_seconds=round(item["candidate_start"] - start, 3),
+            tail_seconds=round(end - item["candidate_end"], 3),
+            timing_revision=item["timing_revision"] + 1,
+            timing_updated_at=now,
+            preview_path=str(preview_path),
+            preview_metadata_path=str(preview_metadata_path),
+            status="pending", reviewed_at=None, updated_at=now,
+        )
+        if clear_note:
+            item["review_note"] = None
+        elif note is not None:
+            item["review_note"] = note
         document["updated_at"] = now
         self._write_document(document)
         return copy.deepcopy(item)
