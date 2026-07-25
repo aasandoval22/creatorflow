@@ -8,12 +8,42 @@
     {
       "name": "Datto",
       "youtube_url": "https://www.youtube.com/@DattoDoesDestiny",
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "Aztecross",
       "youtube_url": "https://www.youtube.com/@AztecrossGaming",
       "enabled": false
+    },
+    {
+      "name": "Jynxzi",
+      "enabled": true,
+      "youtube_url": "https://www.youtube.com/@Jynxzi"
+    },
+    {
+      "name": "CaseOh",
+      "enabled": false,
+      "youtube_url": "https://www.youtube.com/@caseoh_"
+    },
+    {
+      "name": "tarik",
+      "enabled": false,
+      "youtube_url": "https://www.youtube.com/@tarik"
+    },
+    {
+      "name": "Kai Cenat Live",
+      "enabled": false,
+      "youtube_url": "https://www.youtube.com/@KaiCenatLive"
+    },
+    {
+      "name": "SypherPK",
+      "enabled": false,
+      "youtube_url": "https://www.youtube.com/@SypherPK"
+    },
+    {
+      "name": "xQc",
+      "enabled": false,
+      "youtube_url": "https://www.youtube.com/@xQcOW"
     }
   ]
 }
