@@ -1,0 +1,165 @@
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from backend.services.video_manifest import (
+    ManifestError,
+    VideoManifest,
+    VideoStatus,
+)
+
+
+def record(video_id="abc", status=VideoStatus.DISCOVERED.value):
+    return {
+        "video_id": video_id,
+        "source_platform": "youtube",
+        "channel_name": "Creator",
+        "channel_url": "https://www.youtube.com/@creator",
+        "video_url": f"https://www.youtube.com/watch?v={video_id}",
+        "title": "A video",
+        "uploader": "Creator",
+        "upload_date": "20260724",
+        "duration_seconds": 42,
+        "discovered_at": "2026-07-24T12:00:00+00:00",
+        "downloaded_at": None,
+        "local_file_path": None,
+        "status": status,
+        "error_message": None,
+    }
+
+
+def test_creates_empty_manifest_and_parent_directory(tmp_path):
+    path = tmp_path / "nested" / "videos.json"
+
+    manifest = VideoManifest(path)
+
+    assert path.exists()
+    assert manifest.read_records() == []
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "videos": [],
+    }
+
+
+def test_reads_and_writes_records(tmp_path):
+    manifest = VideoManifest(tmp_path / "videos.json")
+
+    saved = manifest.upsert(record())
+
+    assert saved == record()
+    assert manifest.get("abc") == record()
+
+
+def test_updates_without_duplication_and_preserves_discovered_at(tmp_path):
+    manifest = VideoManifest(tmp_path / "videos.json")
+    manifest.upsert(record())
+    updated = record(status=VideoStatus.DOWNLOADED.value)
+    updated["discovered_at"] = "2026-07-25T12:00:00+00:00"
+    updated["downloaded_at"] = "2026-07-25T12:01:00+00:00"
+
+    saved = manifest.upsert(updated)
+
+    assert len(manifest.read_records()) == 1
+    assert saved["status"] == "downloaded"
+    assert saved["discovered_at"] == "2026-07-24T12:00:00+00:00"
+    assert saved["downloaded_at"] == "2026-07-25T12:01:00+00:00"
+
+
+@pytest.mark.parametrize("status", [status.value for status in VideoStatus])
+def test_accepts_all_supported_statuses(tmp_path, status):
+    manifest = VideoManifest(tmp_path / f"{status}.json")
+
+    manifest.upsert(record(status=status))
+
+    assert manifest.get("abc")["status"] == status
+
+
+def test_atomic_write_replaces_manifest_and_removes_temporary_file(tmp_path):
+    path = tmp_path / "videos.json"
+    manifest = VideoManifest(path)
+
+    manifest.upsert(record())
+
+    assert manifest.get("abc") == record()
+    assert list(tmp_path.glob(".videos.json.*.tmp")) == []
+
+
+def test_atomic_failure_preserves_previous_manifest_and_cleans_temp(tmp_path):
+    path = tmp_path / "videos.json"
+    manifest = VideoManifest(path)
+    original = path.read_text(encoding="utf-8")
+
+    with patch(
+        "backend.services.video_manifest.os.replace",
+        side_effect=OSError("replace failed"),
+    ):
+        with pytest.raises(OSError, match="replace failed"):
+            manifest.upsert(record())
+
+    assert path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".videos.json.*.tmp")) == []
+
+
+def test_invalid_json_has_actionable_error(tmp_path):
+    path = tmp_path / "videos.json"
+    path.write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(ManifestError, match="Invalid JSON.*Repair or remove"):
+        VideoManifest(path)
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ([], "must be a JSON object"),
+        ({"videos": []}, "exactly 'version' and 'videos'"),
+        ({"version": 1, "videos": {}}, "'videos' must be a list"),
+        ({"version": 2, "videos": []}, "unsupported version"),
+    ],
+)
+def test_rejects_incorrect_top_level_structure(
+    tmp_path, document, message
+):
+    path = tmp_path / "videos.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ManifestError, match=message):
+        VideoManifest(path)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("not an object", "must be a JSON object"),
+        ({"video_id": "abc"}, "is malformed"),
+        ({**record(), "duration_seconds": -1}, "non-negative number"),
+        ({**record(), "discovered_at": "yesterday"}, "ISO 8601"),
+        (
+            {**record(), "discovered_at": "2026-07-24T12:00:00"},
+            "must use UTC",
+        ),
+    ],
+)
+def test_rejects_malformed_records(tmp_path, value, message):
+    path = tmp_path / "videos.json"
+    path.write_text(
+        json.dumps({"version": 1, "videos": [value]}), encoding="utf-8"
+    )
+
+    with pytest.raises(ManifestError, match=message):
+        VideoManifest(path)
+
+
+def test_rejects_invalid_status(tmp_path):
+    path = tmp_path / "videos.json"
+    path.write_text(
+        json.dumps(
+            {"version": 1, "videos": [record(status="transcribing")]}
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestError, match="invalid status"):
+        VideoManifest(path)

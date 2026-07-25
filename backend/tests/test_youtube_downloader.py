@@ -2,25 +2,61 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from backend.services.video_manifest import VideoStatus
 from backend.services.youtube_downloader import DownloadStatus, YouTubeDownloader
+
+
+VIDEO_URL = "https://www.youtube.com/watch?v=abc"
+CHANNEL_URL = "https://www.youtube.com/@creator"
+VIDEOS_URL = f"{CHANNEL_URL}/videos"
+
+
+def metadata(video_id="abc", **overrides):
+    value = {
+        "id": video_id,
+        "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+        "title": "A video",
+        "uploader": "Creator",
+        "upload_date": "20260724",
+        "duration": 42,
+    }
+    value.update(overrides)
+    return value
 
 
 @pytest.fixture
 def downloader(tmp_path):
-    return YouTubeDownloader(tmp_path / "downloads", tmp_path / "archive")
+    return YouTubeDownloader(
+        tmp_path / "downloads",
+        tmp_path / "archive",
+        tmp_path / "manifests" / "videos.json",
+    )
 
 
-def youtube_dl_mock(download_action):
-    instance = MagicMock()
-    instance.__enter__.return_value = instance
-    if callable(download_action) or isinstance(download_action, BaseException):
-        instance.download.side_effect = download_action
+def youtube_dl_instances(metadata_value, download_action=0, filename=None):
+    metadata_instance = MagicMock()
+    metadata_instance.__enter__.return_value = metadata_instance
+    if isinstance(metadata_value, BaseException):
+        metadata_instance.extract_info.side_effect = metadata_value
     else:
-        instance.download.return_value = download_action
-    return patch("backend.services.youtube_downloader.yt_dlp.YoutubeDL", return_value=instance), instance
+        metadata_instance.extract_info.return_value = metadata_value
+
+    download_instance = MagicMock()
+    download_instance.__enter__.return_value = download_instance
+    if callable(download_action) or isinstance(download_action, BaseException):
+        download_instance.download.side_effect = download_action
+    else:
+        download_instance.download.return_value = download_action
+    download_instance.prepare_filename.return_value = filename
+
+    mocked = patch(
+        "backend.services.youtube_downloader.yt_dlp.YoutubeDL",
+        side_effect=[metadata_instance, download_instance],
+    )
+    return mocked, metadata_instance, download_instance
 
 
-def test_uses_injected_directories(downloader):
+def test_uses_injected_directories_and_preserves_archive_options(downloader):
     options = downloader._build_options()
 
     assert str(downloader.download_directory) in options["outtmpl"]
@@ -31,68 +67,219 @@ def test_uses_injected_directories(downloader):
 @pytest.mark.parametrize(
     ("url", "expected"),
     [
-        ("https://youtube.com/@creator", "https://www.youtube.com/@creator/videos"),
-        ("https://youtube.com/@creator/", "https://www.youtube.com/@creator/videos"),
-        ("https://youtube.com/@creator/videos", "https://www.youtube.com/@creator/videos"),
-        ("https://youtube.com/@creator/?view=0#top", "https://www.youtube.com/@creator/videos"),
+        ("https://youtube.com/@creator", VIDEOS_URL),
+        ("https://youtube.com/@creator/", VIDEOS_URL),
+        ("https://youtube.com/@creator/videos", VIDEOS_URL),
+        ("https://youtube.com/@creator/?view=0#top", VIDEOS_URL),
     ],
 )
 def test_normalizes_channel_video_url(downloader, url, expected):
-    mock_patch, instance = youtube_dl_mock(0)
-    with mock_patch:
+    playlist = {"entries": [metadata()]}
+    mocked, metadata_instance, _ = youtube_dl_instances(playlist)
+
+    with mocked:
         result = downloader.download_recent_channel_videos("Creator", url)
 
-    instance.download.assert_called_once_with([expected])
+    metadata_instance.extract_info.assert_called_once_with(
+        expected, download=False
+    )
     assert result.status is DownloadStatus.SKIPPED
 
 
-def test_returns_success_when_archive_gains_entries(downloader):
+def test_collects_metadata_before_download_and_records_discovered(downloader):
+    events = []
+    original_upsert = downloader.manifest.upsert
+
+    def track_upsert(record):
+        events.append(("manifest", record["status"]))
+        return original_upsert(record)
+
     def download(_urls):
-        downloader.download_archive.write_text("youtube abc\n", encoding="utf-8")
+        events.append(("download", None))
         return 0
 
-    mock_patch, _ = youtube_dl_mock(download)
-    with mock_patch:
-        result = downloader.download_video("https://youtube.com/watch?v=abc")
+    downloader.manifest.upsert = track_upsert
+    mocked, metadata_instance, _ = youtube_dl_instances(metadata(), download)
 
+    with mocked:
+        downloader.download_video(VIDEO_URL)
+
+    metadata_instance.extract_info.assert_called_once_with(
+        VIDEO_URL, download=False
+    )
+    assert events[0] == ("manifest", VideoStatus.DISCOVERED.value)
+    assert events[1] == ("download", None)
+
+
+def test_success_updates_downloaded_path_and_timestamp(downloader):
+    output_path = str(downloader.download_directory / "Creator" / "abc.mp4")
+
+    def download(_urls):
+        downloader.download_archive.write_text(
+            "youtube abc\n", encoding="utf-8"
+        )
+        return 0
+
+    mocked, _, _ = youtube_dl_instances(metadata(), download, output_path)
+    with mocked:
+        result = downloader.download_video(VIDEO_URL)
+
+    saved = downloader.manifest.get("abc")
     assert result.status is DownloadStatus.SUCCESS
     assert result.downloaded_count == 1
+    assert saved["status"] == VideoStatus.DOWNLOADED.value
+    assert saved["local_file_path"] == output_path
+    assert saved["downloaded_at"].endswith("+00:00")
+    assert saved["error_message"] is None
 
 
-def test_preserves_archive_and_returns_skipped(downloader):
-    downloader.download_archive.write_text("youtube abc\n", encoding="utf-8")
-    mock_patch, _ = youtube_dl_mock(0)
+def test_preserves_archive_and_marks_previously_downloaded_as_skipped(
+    downloader,
+):
+    downloader.download_archive.write_text(
+        "youtube abc\n", encoding="utf-8"
+    )
+    mocked, _, _ = youtube_dl_instances(metadata())
 
-    with mock_patch:
-        result = downloader.download_video("https://youtube.com/watch?v=abc")
+    with mocked:
+        result = downloader.download_video(VIDEO_URL)
 
     assert result.status is DownloadStatus.SKIPPED
-    assert downloader.download_archive.read_text(encoding="utf-8") == "youtube abc\n"
+    assert downloader.manifest.get("abc")["status"] == "skipped"
+    assert (
+        downloader.download_archive.read_text(encoding="utf-8")
+        == "youtube abc\n"
+    )
 
 
-def test_returns_failed_for_nonzero_exit(downloader):
-    mock_patch, _ = youtube_dl_mock(1)
+@pytest.mark.parametrize(
+    ("download_action", "message"),
+    [
+        (1, "status 1"),
+        (RuntimeError("offline failure"), "offline failure"),
+    ],
+)
+def test_download_failure_becomes_failed_record(
+    downloader, download_action, message
+):
+    mocked, _, _ = youtube_dl_instances(metadata(), download_action)
 
-    with mock_patch:
-        result = downloader.download_video("https://youtube.com/watch?v=bad")
+    with mocked:
+        result = downloader.download_video(VIDEO_URL)
+
+    saved = downloader.manifest.get("abc")
+    assert result.status is DownloadStatus.FAILED
+    assert saved["status"] == "failed"
+    assert message in saved["error_message"]
+
+
+def test_metadata_failure_returns_failure_without_download(downloader):
+    metadata_instance = MagicMock()
+    metadata_instance.__enter__.return_value = metadata_instance
+    metadata_instance.extract_info.side_effect = RuntimeError(
+        "metadata offline"
+    )
+
+    with patch(
+        "backend.services.youtube_downloader.yt_dlp.YoutubeDL",
+        return_value=metadata_instance,
+    ) as youtube_dl:
+        result = downloader.download_video(VIDEO_URL)
 
     assert result.status is DownloadStatus.FAILED
-    assert "status 1" in result.message
+    assert "metadata offline" in result.message
+    assert youtube_dl.call_count == 1
+    saved = downloader.manifest.get("abc")
+    assert saved["status"] == "failed"
+    assert "metadata offline" in saved["error_message"]
 
 
-def test_returns_failed_for_yt_dlp_exception(downloader):
-    mock_patch, _ = youtube_dl_mock(RuntimeError("offline failure"))
+def test_metadata_failure_without_known_id_does_not_create_record(downloader):
+    metadata_instance = MagicMock()
+    metadata_instance.__enter__.return_value = metadata_instance
+    metadata_instance.extract_info.side_effect = RuntimeError("offline")
 
-    with mock_patch:
-        result = downloader.download_video("https://youtube.com/watch?v=bad")
+    with patch(
+        "backend.services.youtube_downloader.yt_dlp.YoutubeDL",
+        return_value=metadata_instance,
+    ):
+        result = downloader.download_video("https://youtube.com/video")
 
     assert result.status is DownloadStatus.FAILED
-    assert "offline failure" in result.message
+    assert downloader.manifest.read_records() == []
+
+
+def test_missing_optional_metadata_values_are_recorded_as_null(downloader):
+    minimal_metadata = {"id": "abc"}
+    metadata_instance = MagicMock()
+    metadata_instance.__enter__.return_value = metadata_instance
+    metadata_instance.extract_info.return_value = minimal_metadata
+
+    with patch(
+        "backend.services.youtube_downloader.yt_dlp.YoutubeDL",
+        return_value=metadata_instance,
+    ):
+        result = downloader.discover_recent_channel_videos(
+            "Creator", CHANNEL_URL
+        )
+
+    saved = downloader.manifest.get("abc")
+    assert result.status is DownloadStatus.SUCCESS
+    assert saved["title"] is None
+    assert saved["uploader"] is None
+    assert saved["upload_date"] is None
+    assert saved["duration_seconds"] is None
+    assert saved["video_url"].endswith("watch?v=abc")
+
+
+def test_dry_run_discovers_metadata_without_download_or_archive(downloader):
+    playlist = {"entries": [metadata()]}
+    metadata_instance = MagicMock()
+    metadata_instance.__enter__.return_value = metadata_instance
+    metadata_instance.extract_info.return_value = playlist
+
+    with patch(
+        "backend.services.youtube_downloader.yt_dlp.YoutubeDL",
+        return_value=metadata_instance,
+    ) as youtube_dl:
+        result = downloader.discover_recent_channel_videos(
+            "Creator", CHANNEL_URL, 2
+        )
+
+    assert result.status is DownloadStatus.SUCCESS
+    assert downloader.manifest.get("abc")["status"] == "discovered"
+    assert not downloader.download_archive.exists()
+    assert youtube_dl.call_count == 1
+    options = youtube_dl.call_args.args[0]
+    assert options["skip_download"] is True
+    assert "download_archive" not in options
+
+
+def test_accepts_iterable_playlist_entries(downloader):
+    playlist = {"entries": iter([metadata()])}
+    metadata_instance = MagicMock()
+    metadata_instance.__enter__.return_value = metadata_instance
+    metadata_instance.extract_info.return_value = playlist
+
+    with patch(
+        "backend.services.youtube_downloader.yt_dlp.YoutubeDL",
+        return_value=metadata_instance,
+    ):
+        result = downloader.discover_recent_channel_videos(
+            "Creator", CHANNEL_URL
+        )
+
+    assert result.status is DownloadStatus.SUCCESS
+    assert downloader.manifest.get("abc")["status"] == "discovered"
 
 
 def test_rejects_invalid_max_videos_without_calling_yt_dlp(downloader):
-    with patch("backend.services.youtube_downloader.yt_dlp.YoutubeDL") as youtube_dl:
+    with patch(
+        "backend.services.youtube_downloader.yt_dlp.YoutubeDL"
+    ) as youtube_dl:
         with pytest.raises(ValueError, match="at least 1"):
-            downloader.download_recent_channel_videos("Creator", "https://youtube.com/@creator", 0)
+            downloader.download_recent_channel_videos(
+                "Creator", CHANNEL_URL, 0
+            )
 
     youtube_dl.assert_not_called()
