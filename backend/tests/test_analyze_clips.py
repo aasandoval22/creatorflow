@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -61,3 +62,60 @@ def test_cli_prints_candidates_and_summary(tmp_path, capsys):
     assert "Summary: 1 successful, 0 skipped, 0 failed." in output
     artifact = json.loads((tmp_path / "out" / "abc" / "candidates.json").read_text())
     assert artifact["candidates"]
+
+
+def test_cli_score_breakdown_is_opt_in(tmp_path, capsys):
+    transcript = tmp_path / "transcript.json"
+    write_transcript(transcript)
+    manifest_path = tmp_path / "videos.json"
+    manifest = VideoManifest(manifest_path)
+    manifest.upsert(manifest_record("abc", transcript))
+    base = [
+        "--manifest-path", str(manifest_path),
+        "--output-directory", str(tmp_path / "out"),
+        "--video-id", "abc",
+        "--minimum-duration", "12",
+        "--target-duration", "18",
+        "--maximum-duration", "24",
+    ]
+    assert main(base) == 0
+    assert "Components:" not in capsys.readouterr().out
+    assert main(base + ["--force", "--show-score-breakdown"]) == 0
+    output = capsys.readouterr().out
+    assert "Components:" in output
+    assert "Ending classification:" in output
+    assert "Component rounding tolerance: 0.1" in output
+    assert "Positive reasons:" in output
+    assert "Penalties:" in output
+
+
+def test_cli_candidate_order_and_ranks_match_artifact(tmp_path, capsys):
+    transcript = tmp_path / "transcript.json"
+    write_transcript(transcript)
+    manifest_path = tmp_path / "videos.json"
+    manifest = VideoManifest(manifest_path)
+    manifest.upsert(manifest_record("abc", transcript))
+    output_directory = tmp_path / "out"
+    assert main(
+        [
+            "--manifest-path", str(manifest_path),
+            "--output-directory", str(output_directory),
+            "--video-id", "abc",
+            "--minimum-duration", "12",
+            "--target-duration", "18",
+            "--maximum-duration", "24",
+        ]
+    ) == 0
+    output = capsys.readouterr().out
+    displayed = [
+        (int(rank), float(score))
+        for rank, score in re.findall(r"#(\d+).*score (\d+\.\d)", output)
+    ]
+    artifact = json.loads(
+        (output_directory / "abc" / "candidates.json").read_text()
+    )
+    serialized = [
+        (candidate["rank"], candidate["score"])
+        for candidate in artifact["candidates"]
+    ]
+    assert displayed == serialized
