@@ -45,6 +45,21 @@ class ClipTimingAdjustmentService:
         note: str | None = None, clear_note: bool = False,
         dry_run: bool = False, force: bool = True,
     ) -> TimingAdjustmentResult:
+        with self.queue.locked():
+            return self._adjust_locked(
+                review_id, lead_in=lead_in, tail=tail,
+                render_start=render_start, render_end=render_end,
+                allow_longer=allow_longer, note=note, clear_note=clear_note,
+                dry_run=dry_run, force=force,
+            )
+
+    def _adjust_locked(
+        self, review_id: str, *, lead_in: float | None = None,
+        tail: float | None = None, render_start: float | None = None,
+        render_end: float | None = None, allow_longer: bool = False,
+        note: str | None = None, clear_note: bool = False,
+        dry_run: bool = False, force: bool = True,
+    ) -> TimingAdjustmentResult:
         item = self.queue.find_by_review_id(review_id)
         if item is None:
             raise ReviewQueueError(f"Review ID {review_id!r} was not found.")

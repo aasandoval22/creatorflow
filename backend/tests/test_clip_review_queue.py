@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -175,3 +176,50 @@ def test_timing_update_preserves_candidate_and_note(tmp_path):
     assert rerun["candidate_start"] == 10 and rerun["candidate_end"] == 20
     assert rerun["render_start"] == 8 and rerun["render_end"] == 24
     assert rerun["status"] == "pending" and rerun["review_note"] == "keep"
+
+
+def test_distinct_instances_serialize_concurrent_updates(tmp_path):
+    path = tmp_path / "reviews.json"
+    first_queue = ClipReviewQueue(path)
+    first = add(first_queue)
+    second = first_queue.add_or_update_preview(
+        "video", candidate("c2", rank=2), "/tmp/second.mp4", "/tmp/second.json"
+    )
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def update(review_id, action):
+        try:
+            queue = ClipReviewQueue(path)
+            barrier.wait()
+            action(queue, review_id)
+        except Exception as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=update, args=(first["review_id"], lambda q, rid: q.approve(rid))),
+        threading.Thread(target=update, args=(second["review_id"], lambda q, rid: q.reject(rid))),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors
+    statuses = {item["review_id"]: item["status"] for item in ClipReviewQueue(path).list_items()}
+    assert statuses == {first["review_id"]: "approved", second["review_id"]: "rejected"}
+
+
+def test_lock_is_released_after_exception_and_corrupt_queue_is_not_overwritten(tmp_path):
+    path = tmp_path / "reviews.json"
+    queue = ClipReviewQueue(path)
+    item = add(queue)
+    with pytest.raises(RuntimeError):
+        with queue.locked():
+            raise RuntimeError("boom")
+    assert queue.approve(item["review_id"])["status"] == "approved"
+
+    path.write_text("{broken", encoding="utf-8")
+    with pytest.raises(ReviewQueueError):
+        queue.reject(item["review_id"])
+    assert path.read_text(encoding="utf-8") == "{broken"
+    assert not list(tmp_path.glob(".reviews.*.tmp"))
