@@ -112,12 +112,19 @@ python -m backend.app.analyze_clips --video-id VIDEO_ID
 python -m backend.app.analyze_clips --video-id VIDEO_ID --force
 python -m backend.app.analyze_clips --minimum-duration 25 --target-duration 40 --maximum-duration 55
 python -m backend.app.analyze_clips --video-id VIDEO_ID --show-score-breakdown
+python -m backend.app.analyze_clips --padding-before 0.15 --padding-after 0.25 --minimum-boundary-confidence 0.6
 ```
 
 Ranked artifacts are written to
 `data/clip_candidates/<video_id>/candidates.json`. Ranking uses transparent,
 deterministic text and timing heuristics: identical transcript input and
 configuration produce identical candidate boundaries, IDs, and scores.
+When complete word timestamps are available, candidates can start and end
+inside transcription segments at detected sentence, pause, and grammatical
+thought boundaries. Invalid or incomplete word timing falls back safely to
+segment boundaries. Candidate artifacts include deterministic start/end
+confidence and the major boundary methods used. Small configurable media
+padding is applied after selecting the spoken words and clamped to media bounds.
 Heuristic scores prioritize potentially self-contained moments; they do not
 predict actual popularity or virality. This stage does not cut, render,
 upload, or publish video. Add `--show-score-breakdown` to print each returned

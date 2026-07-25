@@ -45,6 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-duration", type=positive_number, default=35)
     parser.add_argument("--maximum-duration", type=positive_number, default=60)
     parser.add_argument("--maximum-candidates", type=positive_integer, default=10)
+    parser.add_argument("--padding-before", type=float, default=0.15)
+    parser.add_argument("--padding-after", type=float, default=0.25)
+    parser.add_argument("--minimum-boundary-confidence", type=float, default=0.55)
     parser.add_argument(
         "--show-score-breakdown",
         action="store_true",
@@ -62,6 +65,9 @@ def main(argv: Sequence[str] | None = ()) -> int:
             target_duration_seconds=args.target_duration,
             maximum_duration_seconds=args.maximum_duration,
             maximum_candidates=args.maximum_candidates,
+            padding_before_seconds=args.padding_before,
+            padding_after_seconds=args.padding_after,
+            minimum_boundary_confidence=args.minimum_boundary_confidence,
         )
         generator = ClipCandidateGenerator(
             manifest_path=args.manifest_path,
@@ -90,6 +96,14 @@ def main(argv: Sequence[str] | None = ()) -> int:
                 print(
                     f"    Ending classification: "
                     f"{candidate['ending_classification']}"
+                )
+                boundary = candidate["boundary_details"]
+                print(
+                    "    Boundaries: "
+                    f"start={boundary['start_method']} "
+                    f"({boundary['start_confidence']:.2f}), "
+                    f"end={boundary['end_method']} "
+                    f"({boundary['end_confidence']:.2f})"
                 )
                 components = ", ".join(
                     f"{name}={value:.1f}"

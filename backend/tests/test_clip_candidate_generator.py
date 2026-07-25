@@ -273,6 +273,224 @@ def timed_texts(texts, seconds=5, pauses=None):
     return result
 
 
+def word_segment(tokens, *, segment_id=7, spacing=0.5, pauses=None, end=None):
+    pauses = pauses or {}
+    words = []
+    timestamp = 0.0
+    for index, token in enumerate(tokens):
+        timestamp += pauses.get(index, 0)
+        words.append(
+            {
+                "word": token if index == 0 else f" {token}",
+                "start": timestamp,
+                "end": timestamp + spacing,
+            }
+        )
+        timestamp += spacing
+    return {
+        "id": segment_id,
+        "start": 0.0,
+        "end": end if end is not None else timestamp,
+        "text": " ".join(tokens),
+        "words": words,
+    }
+
+
+def word_quality_generator(**overrides):
+    values = {
+        "minimum_duration_seconds": 3,
+        "target_duration_seconds": 5,
+        "maximum_duration_seconds": 8,
+        "minimum_word_count": 6,
+        "maximum_overlap": 0.5,
+        "maximum_candidates": 5,
+    }
+    values.update(overrides)
+    generator = ClipCandidateGenerator.__new__(ClipCandidateGenerator)
+    generator.configuration = CandidateConfiguration(**values)
+    return generator
+
+
+def test_word_timeline_is_normalized_and_preserves_provenance_and_punctuation():
+    segment = word_segment(["Hello,", "WORLD!"])
+    timeline = ClipCandidateGenerator.build_word_timeline([segment])
+    assert [word.text.strip() for word in timeline] == ["Hello,", "WORLD!"]
+    assert [word.normalized_text for word in timeline] == ["hello", "world"]
+    assert timeline[1].source_segment_id == 7
+    assert timeline[1].source_segment_index == 0
+    assert timeline[1].word_index == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda words: words[0].update(start=None),
+        lambda words: words[0].update(end=None),
+        lambda words: words[1].update(start=-1),
+        lambda words: words[1].update(start=0.1),
+        lambda words: words[1].update(word=""),
+    ],
+)
+def test_malformed_or_nonchronological_words_are_ignored(mutation):
+    segment = word_segment(["How", "this", "works.", "That", "is", "complete."])
+    mutation(segment["words"])
+    timeline = ClipCandidateGenerator.build_word_timeline([segment])
+    assert len(timeline) == 5
+
+
+def test_segment_with_no_usable_word_timestamps_triggers_fallback():
+    segment = word_segment(["untimed"])
+    segment["words"][0]["start"] = None
+    assert ClipCandidateGenerator.build_word_timeline([segment]) == []
+
+
+def test_segment_without_words_triggers_existing_fallback():
+    generator = quality_generator()
+    transcript = timed_texts(
+        [
+            "How does the build work? Here is the answer.",
+            "The setup uses a named grenade mechanic.",
+            "That is the complete recommendation.",
+        ]
+    )
+    candidates = generator.generate_candidates("abc", transcript)
+    assert candidates
+    assert candidates[0]["start"] % 5 == 0
+
+
+def test_word_candidate_can_start_and_end_inside_one_segment_and_retain_text_only():
+    tokens = [
+        "discard", "this.", "How", "does", "this", "build", "work?",
+        "The", "grenade", "refreshes", "cooldown.", "trailing", "setup",
+    ]
+    generator = word_quality_generator(minimum_duration_seconds=3)
+    candidate = generator.generate_candidates(
+        "abc", [word_segment(tokens)], media_duration=20
+    )[0]
+    assert candidate["text"].startswith("How does this build work?")
+    assert candidate["text"].endswith("cooldown.")
+    assert "discard" not in candidate["text"]
+    assert "trailing" not in candidate["text"]
+    assert candidate["segment_ids"] == [7]
+    assert candidate["start"] == pytest.approx(0.85)
+    assert candidate["end"] == pytest.approx(5.75)
+
+
+def test_pause_and_punctuation_create_confident_word_boundaries():
+    segment = word_segment(
+            [
+                "unfinished", "material", "How", "this", "build", "works",
+                "The", "grenade", "solves", "it", "completely", "Another",
+            ],
+            pauses={2: 0.8, 11: 0.8},
+    )
+    generator = word_quality_generator(minimum_duration_seconds=4)
+    candidates = generator.generate_candidates("abc", [segment], media_duration=20)
+    assert candidates
+    details = candidates[0]["boundary_details"]
+    assert "pause" in details["start_method"]
+    assert "pause" in details["end_method"]
+    assert details["start_confidence"] >= 0.6
+    assert details["end_confidence"] >= 0.6
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        ["to", "the", "next", "level"],
+        ["guns", "and", "then"],
+        ["just", "the", "usual"],
+        ["made", "last", "year"],
+        ["does", "not", "consume"],
+    ],
+)
+def test_invalid_word_openings_have_low_confidence(opening):
+    words = ClipCandidateGenerator.build_word_timeline(
+        [word_segment(opening + ["The", "answer", "is", "complete."])]
+    )
+    details, reasons = word_quality_generator()._assess_word_start(words, 0)
+    assert details["confidence"] < 0.55
+    assert any("continues" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [
+        ["I'm", "running"],
+        ["because", "you", "should", "be", "grappling"],
+        ["the", "higher", "the", "difficulty", "of", "the", "content", "you're", "in"],
+        ["two-piece", "crodas"],
+        ["put", "on", "some", "good"],
+    ],
+)
+def test_known_unfinished_word_endings_are_incomplete(ending):
+    tokens = ["How", "does", "this", "work?"] + ending + ["The", "answer", "follows."]
+    words = ClipCandidateGenerator.build_word_timeline([word_segment(tokens)])
+    index = 3 + len(ending)
+    assessment, details = word_quality_generator()._assess_word_end(words, index)
+    assert assessment.classification is EndingClassification.INCOMPLETE
+    assert details["confidence"] < 0.55
+
+
+def test_padding_is_configurable_and_clamped_to_media_bounds():
+    tokens = ["How", "does", "it", "work?", "This", "answer", "is", "complete."]
+    segment = word_segment(tokens)
+    segment["words"][0]["start"] = 0.05
+    generator = word_quality_generator(
+        padding_before_seconds=0.5, padding_after_seconds=2
+    )
+    candidate = generator.generate_candidates(
+        "abc", [segment], media_duration=4.1
+    )[0]
+    assert candidate["start"] == 0
+    assert candidate["end"] == 4.1
+
+
+def test_no_acceptable_word_ending_before_maximum_returns_no_candidate():
+    tokens = [
+        "How", "does", "this", "work", "because", "you", "should", "be",
+        "grappling", "and", "then", "continue", "far", "beyond", "the", "limit",
+    ]
+    generator = word_quality_generator(
+        target_duration_seconds=4, maximum_duration_seconds=4
+    )
+    assert generator.generate_candidates("abc", [word_segment(tokens)]) == []
+
+
+def test_word_candidate_retains_ids_across_partial_segments():
+    first = word_segment(
+        ["discard.", "How", "does", "this", "build", "work?"],
+        segment_id="a",
+    )
+    second = word_segment(
+        ["The", "grenade", "refreshes", "the", "cooldown.", "trailing"],
+        segment_id="b",
+    )
+    offset = first["end"]
+    second["start"] += offset
+    second["end"] += offset
+    for word in second["words"]:
+        word["start"] += offset
+        word["end"] += offset
+    candidates = word_quality_generator().generate_candidates(
+        "abc", [first, second], media_duration=20
+    )
+    assert candidates[0]["segment_ids"] == ["a", "b"]
+
+
+def test_complete_thought_beats_exact_target_and_word_output_is_deterministic():
+    tokens = [
+        "How", "does", "this", "build", "work?", "The", "target", "duration",
+        "lands", "here", "but", "the", "answer", "finishes", "completely.",
+    ]
+    generator = word_quality_generator(target_duration_seconds=5)
+    first = generator.generate_candidates("abc", [word_segment(tokens)])
+    second = generator.generate_candidates("abc", [word_segment(tokens)])
+    assert first == second
+    assert first[0]["text"].endswith("completely.")
+    assert first[0]["duration"] > 5
+
+
 @pytest.mark.parametrize(
     "fragment",
     [
@@ -570,6 +788,7 @@ def test_authoritative_ending_classification_has_consistent_reasons():
         "because the final mechanic still needs an explanation",
         "Because the final mechanic still needs an explanation.",
         "The reason is",
+        "The recommendation is useful in fact",
     ],
 )
 def test_trailing_conjunctions_and_dependent_clauses_are_incomplete(text):
