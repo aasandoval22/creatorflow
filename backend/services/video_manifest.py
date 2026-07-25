@@ -10,7 +10,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST_PATH = PROJECT_ROOT / "data" / "manifests" / "videos.json"
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 RECORD_FIELDS_V1 = {
     "video_id",
     "source_platform",
@@ -27,7 +27,8 @@ RECORD_FIELDS_V1 = {
     "status",
     "error_message",
 }
-RECORD_FIELDS = RECORD_FIELDS_V1 | {"transcription"}
+RECORD_FIELDS_V2 = RECORD_FIELDS_V1 | {"transcription"}
+RECORD_FIELDS = RECORD_FIELDS_V2 | {"clip_analysis"}
 NULLABLE_FIELDS = {
     "channel_name",
     "channel_url",
@@ -51,6 +52,14 @@ TRANSCRIPTION_FIELDS = {
     "error_message",
 }
 TRANSCRIPTION_NULLABLE_STRING_FIELDS = TRANSCRIPTION_FIELDS - {"status"}
+CLIP_ANALYSIS_FIELDS = {
+    "status",
+    "started_at",
+    "completed_at",
+    "candidate_count",
+    "candidates_json_path",
+    "error_message",
+}
 
 
 class ManifestError(ValueError):
@@ -65,6 +74,14 @@ class VideoStatus(str, Enum):
 
 
 class TranscriptionStatus(str, Enum):
+    NOT_STARTED = "not_started"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class ClipAnalysisStatus(str, Enum):
     NOT_STARTED = "not_started"
     PROCESSING = "processing"
     COMPLETED = "completed"
@@ -88,6 +105,19 @@ def default_transcription() -> dict[str, Any]:
     }
 
 
+def default_clip_analysis() -> dict[str, Any]:
+    """Return a fresh default clip-analysis state."""
+
+    return {
+        "status": ClipAnalysisStatus.NOT_STARTED.value,
+        "started_at": None,
+        "completed_at": None,
+        "candidate_count": 0,
+        "candidates_json_path": None,
+        "error_message": None,
+    }
+
+
 def utc_now() -> str:
     """Return the current time as a UTC ISO 8601 timestamp."""
 
@@ -103,15 +133,17 @@ class VideoManifest:
             self._write_document(self._empty_document())
         else:
             document = self._read_document()
-            if isinstance(document, dict) and document.get("version") == 1:
-                self._validate_document(document, version=1)
-                document = {
-                    "version": MANIFEST_VERSION,
-                    "videos": [
-                        {**record, "transcription": default_transcription()}
-                        for record in document["videos"]
-                    ],
-                }
+            if isinstance(document, dict) and document.get("version") in (1, 2):
+                source_version = document["version"]
+                self._validate_document(document, version=source_version)
+                videos = []
+                for record in document["videos"]:
+                    migrated = copy.deepcopy(record)
+                    if source_version == 1:
+                        migrated["transcription"] = default_transcription()
+                    migrated["clip_analysis"] = default_clip_analysis()
+                    videos.append(migrated)
+                document = {"version": MANIFEST_VERSION, "videos": videos}
                 self._write_document(document)
             else:
                 self._validate_document(document)
@@ -165,11 +197,16 @@ class VideoManifest:
 
         if "transcription" not in candidate:
             candidate["transcription"] = default_transcription()
+        if "clip_analysis" not in candidate:
+            candidate["clip_analysis"] = default_clip_analysis()
         if existing_index is not None:
             existing = records[existing_index]
             candidate["discovered_at"] = existing["discovered_at"]
             candidate["transcription"] = copy.deepcopy(
                 existing["transcription"]
+            )
+            candidate["clip_analysis"] = copy.deepcopy(
+                existing["clip_analysis"]
             )
 
         self._validate_record(candidate, "new record", RECORD_FIELDS)
@@ -203,6 +240,32 @@ class VideoManifest:
         record["transcription"].update(copy.deepcopy(changes))
         self._validate_transcription(
             record["transcription"], f"record {video_id!r}"
+        )
+        self._write_document(
+            {"version": MANIFEST_VERSION, "videos": records}
+        )
+        return copy.deepcopy(record)
+
+    def update_clip_analysis(
+        self, video_id: str, **changes: Any
+    ) -> dict[str, Any]:
+        """Update selected clip-analysis fields without replacing metadata."""
+
+        unknown = set(changes) - CLIP_ANALYSIS_FIELDS
+        if unknown:
+            raise ManifestError(
+                "Unknown clip-analysis fields: "
+                f"{', '.join(sorted(unknown))}."
+            )
+        records = self.read_records()
+        record = next(
+            (item for item in records if item["video_id"] == video_id), None
+        )
+        if record is None:
+            raise ManifestError(f"Video {video_id!r} was not found.")
+        record["clip_analysis"].update(copy.deepcopy(changes))
+        self._validate_clip_analysis(
+            record["clip_analysis"], f"record {video_id!r}"
         )
         self._write_document(
             {"version": MANIFEST_VERSION, "videos": records}
@@ -254,7 +317,11 @@ class VideoManifest:
                 f"Video manifest {self.path} field 'videos' must be a list."
             )
 
-        fields = RECORD_FIELDS_V1 if version == 1 else RECORD_FIELDS
+        fields = {
+            1: RECORD_FIELDS_V1,
+            2: RECORD_FIELDS_V2,
+            3: RECORD_FIELDS,
+        }.get(version, RECORD_FIELDS)
         seen_ids: set[str] = set()
         for index, record in enumerate(document["videos"], start=1):
             self._validate_record(record, f"record {index}", fields)
@@ -324,6 +391,8 @@ class VideoManifest:
                 self._validate_timestamp(record[field], label, field)
         if "transcription" in expected_fields:
             self._validate_transcription(record["transcription"], label)
+        if "clip_analysis" in expected_fields:
+            self._validate_clip_analysis(record["clip_analysis"], label)
 
     def _validate_transcription(self, value: Any, label: str) -> None:
         if not isinstance(value, dict):
@@ -352,6 +421,45 @@ class VideoManifest:
             if field_value is not None and not isinstance(field_value, str):
                 raise ManifestError(
                     f"Video manifest {self.path} {label} transcription field "
+                    f"{field!r} must be a string or null."
+                )
+        for field in ("started_at", "completed_at"):
+            if value[field] is not None:
+                self._validate_timestamp(value[field], label, field)
+
+    def _validate_clip_analysis(self, value: Any, label: str) -> None:
+        if not isinstance(value, dict):
+            raise ManifestError(
+                f"Video manifest {self.path} {label} field "
+                "'clip_analysis' must be an object."
+            )
+        if set(value) != CLIP_ANALYSIS_FIELDS:
+            raise ManifestError(
+                f"Video manifest {self.path} {label} clip_analysis "
+                "structure is malformed."
+            )
+        try:
+            ClipAnalysisStatus(value["status"])
+        except (TypeError, ValueError) as error:
+            supported = ", ".join(
+                status.value for status in ClipAnalysisStatus
+            )
+            raise ManifestError(
+                f"Video manifest {self.path} {label} has invalid "
+                f"clip-analysis status {value['status']!r}; expected one of: "
+                f"{supported}."
+            ) from error
+        count = value["candidate_count"]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ManifestError(
+                f"Video manifest {self.path} {label} clip_analysis field "
+                "'candidate_count' must be a non-negative integer."
+            )
+        for field in ("candidates_json_path", "error_message"):
+            field_value = value[field]
+            if field_value is not None and not isinstance(field_value, str):
+                raise ManifestError(
+                    f"Video manifest {self.path} {label} clip_analysis field "
                     f"{field!r} must be a string or null."
                 )
         for field in ("started_at", "completed_at"):

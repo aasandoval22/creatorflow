@@ -5,10 +5,12 @@ from unittest.mock import patch
 import pytest
 
 from backend.services.video_manifest import (
+    ClipAnalysisStatus,
     ManifestError,
     TranscriptionStatus,
     VideoManifest,
     VideoStatus,
+    default_clip_analysis,
     default_transcription,
 )
 
@@ -30,6 +32,7 @@ def record(video_id="abc", status=VideoStatus.DISCOVERED.value):
         "status": status,
         "error_message": None,
         "transcription": default_transcription(),
+        "clip_analysis": default_clip_analysis(),
     }
 
 
@@ -41,7 +44,7 @@ def test_creates_empty_manifest_and_parent_directory(tmp_path):
     assert path.exists()
     assert manifest.read_records() == []
     assert json.loads(path.read_text(encoding="utf-8")) == {
-        "version": 2,
+        "version": 3,
         "videos": [],
     }
 
@@ -119,7 +122,7 @@ def test_invalid_json_has_actionable_error(tmp_path):
         ([], "must be a JSON object"),
         ({"videos": []}, "exactly 'version' and 'videos'"),
         ({"version": 1, "videos": {}}, "'videos' must be a list"),
-        ({"version": 3, "videos": []}, "unsupported version"),
+        ({"version": 4, "videos": []}, "unsupported version"),
     ],
 )
 def test_rejects_incorrect_top_level_structure(
@@ -148,7 +151,7 @@ def test_rejects_incorrect_top_level_structure(
 def test_rejects_malformed_records(tmp_path, value, message):
     path = tmp_path / "videos.json"
     path.write_text(
-        json.dumps({"version": 2, "videos": [value]}), encoding="utf-8"
+        json.dumps({"version": 3, "videos": [value]}), encoding="utf-8"
     )
 
     with pytest.raises(ManifestError, match=message):
@@ -159,7 +162,7 @@ def test_rejects_invalid_status(tmp_path):
     path = tmp_path / "videos.json"
     path.write_text(
         json.dumps(
-            {"version": 2, "videos": [record(status="transcribing")]}
+            {"version": 3, "videos": [record(status="transcribing")]}
         ),
         encoding="utf-8",
     )
@@ -172,6 +175,7 @@ def test_migrates_version_one_atomically_and_preserves_records(tmp_path):
     path = tmp_path / "videos.json"
     old_record = record()
     old_record.pop("transcription")
+    old_record.pop("clip_analysis")
     path.write_text(
         json.dumps({"version": 1, "videos": [old_record]}),
         encoding="utf-8",
@@ -180,8 +184,12 @@ def test_migrates_version_one_atomically_and_preserves_records(tmp_path):
     manifest = VideoManifest(path)
 
     saved = manifest.get("abc")
-    assert saved | {} == {**old_record, "transcription": default_transcription()}
-    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
+    assert saved | {} == {
+        **old_record,
+        "transcription": default_transcription(),
+        "clip_analysis": default_clip_analysis(),
+    }
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 3
     assert list(tmp_path.glob(".videos.json.*.tmp")) == []
     assert VideoManifest(path).get("abc") == saved
 
@@ -190,6 +198,7 @@ def test_migration_failure_preserves_version_one_file(tmp_path):
     path = tmp_path / "videos.json"
     old_record = record()
     old_record.pop("transcription")
+    old_record.pop("clip_analysis")
     original = json.dumps({"version": 1, "videos": [old_record]})
     path.write_text(original, encoding="utf-8")
 
@@ -202,6 +211,88 @@ def test_migration_failure_preserves_version_one_file(tmp_path):
 
     assert path.read_text(encoding="utf-8") == original
     assert list(tmp_path.glob(".videos.json.*.tmp")) == []
+
+
+def test_migrates_version_two_to_three_preserving_transcription(tmp_path):
+    path = tmp_path / "videos.json"
+    old_record = record()
+    old_record.pop("clip_analysis")
+    old_record["transcription"].update(
+        status=TranscriptionStatus.COMPLETED.value,
+        transcript_json_path="/tmp/transcript.json",
+    )
+    path.write_text(
+        json.dumps({"version": 2, "videos": [old_record]}),
+        encoding="utf-8",
+    )
+
+    saved = VideoManifest(path).get("abc")
+
+    assert saved["transcription"] == old_record["transcription"]
+    assert saved["clip_analysis"] == default_clip_analysis()
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 3
+
+
+@pytest.mark.parametrize(
+    ("analysis", "message"),
+    [
+        (None, "must be an object"),
+        ({}, "structure is malformed"),
+        (
+            {**default_clip_analysis(), "status": "unknown"},
+            "invalid clip-analysis status",
+        ),
+        (
+            {**default_clip_analysis(), "candidate_count": -1},
+            "non-negative integer",
+        ),
+        (
+            {**default_clip_analysis(), "candidate_count": True},
+            "non-negative integer",
+        ),
+        (
+            {**default_clip_analysis(), "candidates_json_path": 5},
+            "string or null",
+        ),
+        (
+            {**default_clip_analysis(), "started_at": "yesterday"},
+            "ISO 8601",
+        ),
+    ],
+)
+def test_rejects_invalid_clip_analysis(tmp_path, analysis, message):
+    path = tmp_path / "videos.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "videos": [{**record(), "clip_analysis": analysis}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ManifestError, match=message):
+        VideoManifest(path)
+
+
+def test_clip_analysis_update_and_rediscovery_preserve_state(tmp_path):
+    manifest = VideoManifest(tmp_path / "videos.json")
+    original = manifest.upsert(record())
+    manifest.update_clip_analysis(
+        "abc",
+        status=ClipAnalysisStatus.COMPLETED.value,
+        started_at="2026-07-24T12:01:00+00:00",
+        completed_at="2026-07-24T12:02:00+00:00",
+        candidate_count=2,
+        candidates_json_path="/tmp/candidates.json",
+    )
+    rediscovered = record()
+    rediscovered["title"] = "Updated"
+    saved = manifest.upsert(rediscovered)
+    assert saved["clip_analysis"]["status"] == "completed"
+    assert saved["clip_analysis"]["candidate_count"] == 2
+    assert saved["title"] == "Updated"
+    assert saved["video_id"] == original["video_id"]
 
 
 @pytest.mark.parametrize(
@@ -235,7 +326,7 @@ def test_rejects_invalid_transcription(tmp_path, transcription, message):
     path.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "videos": [{**record(), "transcription": transcription}],
             }
         ),
