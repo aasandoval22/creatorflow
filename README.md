@@ -522,32 +522,59 @@ Commands:
 
 Discovery uses several documented default searches: funny gaming moments,
 streamer reactions, competitive clutches, gaming failures, gaming challenges,
-and horror-game reactions. Configure the target count, source pool,
-publication window, region, creator/topic caps, queries, and media retention
-with `discover --help`. The defaults select 20 candidates, cap a creator at
-two, cap an inferred game/topic at three, and retain selected local previews.
-A dry run performs API search, hydration, and ranking planning but does not
-download media or mutate review state.
+and horror-game reactions. Search placement is never enough to qualify a
+candidate. Hydrated category, title, description, tags, channel, and query
+metadata must provide positive gaming evidence. YouTube category 20 is strong
+evidence. Entertainment and other categories require a recognized game,
+gaming-specific tags or terminology, or a gaming query corroborated by the
+video metadata. Query-only animal challenges, generic celebrity challenges,
+unrelated reactions, and non-gaming sketches are excluded with visible
+reasons. For non-Gaming categories, explicit unrelated title subjects also
+override contradictory gaming keywords found only in tags or descriptions.
 
-Ranking model version 1 has visible components for logarithmic raw views,
-views per day, like/view and comment/view ratios when available, recency,
-duration suitability, verified vertical composition, and missing-evidence
-penalties. Near-identical normalized titles are deduplicated, then creator and
-inferred-topic caps are applied. These heuristics help triage public evidence;
-they do not predict virality or objectively measure quality.
+Configure the source pool, publication window, region, creator/topic caps,
+queries, cohort sizes, and media retention with `discover --help`. The default
+benchmark plan is 10 established high-view references plus 10 recent breakout
+references. Set `--established-count` and `--breakout-count` explicitly, or
+use `--target-count` to request a balanced split. Creator and inferred-topic
+caps apply across both cohorts: two per creator and three per game/topic by
+default.
 
-Normal discovery locally downloads a shortlist and uses FFprobe to require a
+Ranking model version 2 exposes separate cohort weights. Established ranking
+emphasizes total views, engagement, gaming relevance, and verified vertical
+composition. Breakout ranking emphasizes views per day, recency, engagement,
+gaming relevance, and verified vertical composition. Both expose duration,
+missing-evidence, source-quality, and diversity components. Compilation and
+ranking markers receive visible penalties; explicit reposts and multi-creator
+rankings are excluded. Near-duplicate titles retain the source with stronger
+originality evidence. These heuristics help triage public evidence; neither
+cohort predicts virality or objectively measures quality.
+
+Topic inference uses a maintainable alias map over title, description, tags,
+and query metadata. For example, FNAF maps to `fnaf`, COD to `call-of-duty`,
+and recognized Roblox, Fortnite, and Minecraft evidence maps to their named
+topics. Metadata-qualified gaming clips with no recognized game use
+`unknown-gaming`; generic words such as “guess,” “funniest,” or “reaction”
+never become topics.
+
+Dry-run selections are labeled `metadata-qualified` with provisional media
+verification. A dry run never downloads media or changes the queue. Normal
+discovery locally downloads a bounded shortlist and uses FFprobe to require a
 playable video stream, audio stream, approximately vertical composition, and a
-5–180 second duration. Search results alone are never treated as proof that a
-video is a Short. Metadata snapshots, scores, validation results, review state,
-and retained media are stored atomically under ignored
+5–180 second duration. It then reranks the media-verified pool. Rejected media
+validation is reported explicitly, and only `media-verified` candidates enter
+the reference-review queue. Search results alone are never treated as proof
+that a video is a Short. Metadata snapshots, scores, validation results,
+review state, and retained media are stored atomically under ignored
 `data/reference_discovery/`.
 
 Open `/reference-candidates` on the existing loopback review server. Each card
 shows the public source, local preview when retained, creator, publication and
-capture times, statistics, ranking evidence, media measurements, and any
-available analysis. A reviewer can leave notes, assign a category, reject,
-mark a duplicate, or accept. Acceptance creates a distinguishable
+capture times, statistics, cohort, gaming/source evidence, validation stage,
+ranking evidence, media measurements, and any available analysis. A reviewer
+can leave notes, correct the inferred game/topic, assign a category, reject,
+mark a duplicate, or accept. Manual topic corrections survive rediscovery and
+statistics refresh. Acceptance creates a distinguishable
 `automatic_youtube_discovery` source snapshot and then uses the existing strict
 reference registration and analysis pipeline. Profile rebuilding remains a
 separate explicit action. Rejected and merely discovered candidates never
