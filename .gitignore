@@ -28,6 +28,8 @@ data/manifests/*.json
 data/manifests/.*.tmp
 data/transcripts/
 data/transcripts/**/.*.tmp
+data/clip_candidates/
+data/clip_candidates/**/.*.tmp
 data/models/
 .cache/huggingface/
 .cache/whisper/

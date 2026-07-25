@@ -95,3 +95,28 @@ transcript, and the SRT file contains numbered subtitle blocks.
 The regular offline test suite injects fake models and uses temporary local
 files. It does not install or load faster-whisper, download model files,
 decode real media, or perform real transcription.
+
+## Transcript clip-candidate analysis
+
+CreatorFlow's local workflow is ingestion → transcription → clip-candidate
+generation. Analyze all eligible downloaded videos with completed transcripts:
+
+```bash
+python -m backend.app.analyze_clips
+```
+
+Selection and configuration examples:
+
+```bash
+python -m backend.app.analyze_clips --video-id VIDEO_ID
+python -m backend.app.analyze_clips --video-id VIDEO_ID --force
+python -m backend.app.analyze_clips --minimum-duration 25 --target-duration 40 --maximum-duration 55
+```
+
+Ranked artifacts are written to
+`data/clip_candidates/<video_id>/candidates.json`. Ranking uses transparent,
+deterministic text and timing heuristics: identical transcript input and
+configuration produce identical candidate boundaries, IDs, and scores.
+Heuristic scores prioritize potentially self-contained moments; they do not
+predict actual popularity or virality. This stage does not cut, render,
+upload, or publish video.
