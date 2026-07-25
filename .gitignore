@@ -37,6 +37,7 @@ data/models/
 data/reference_clips/
 data/reference_profiles/
 data/reference_comparisons/
+data/reference_discovery/
 data/production/
 data/logs/production.jsonl
 data/reference_clips/**/.analysis.*

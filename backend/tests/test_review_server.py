@@ -13,6 +13,7 @@ import pytest
 
 from backend.app import review_server
 from backend.services.clip_review_queue import ClipReviewQueue, ReviewQueueError
+from backend.services.reference_discovery import ReferenceCandidateQueue
 
 
 def candidate(identifier: str = "candidate_1", *, rank: int = 1, score: float = 90) -> dict:
@@ -229,6 +230,110 @@ def test_failed_reference_comparison_preserves_review_state(tmp_path):
         after = queue.find_by_review_id(rid)
     assert status == 303 and "error=" in headers["Location"]
     assert before == after
+
+
+class FakeReferenceDiscovery:
+    def __init__(self, queue):
+        self.queue = queue
+        self.accepted = []
+
+    def accept(self, video_id, *, category, notes, transcription):
+        self.accepted.append((video_id, category, notes, transcription))
+        self.queue.decide(
+            video_id, "accepted", notes=notes, category=category,
+            accepted_reference_id=f"youtube-{video_id}",
+        )
+
+
+def reference_candidate(tmp_path):
+    media = tmp_path / "reference-candidate.mp4"
+    media.write_bytes(b"reference-media")
+    return {
+        "video_id": "short_one",
+        "title": "Gaming & reaction", "creator": "Creator",
+        "published_at": "2026-07-20T00:00:00Z",
+        "captured_at": "2026-07-25T00:00:00Z",
+        "view_count": 1000, "like_count": 50, "comment_count": 4,
+        "duration": 42, "verified_duration": 42, "width": 1080,
+        "height": 1920, "frame_rate": 60, "has_video": True,
+        "has_audio": True, "source_url": "https://www.youtube.com/watch?v=short_one",
+        "discovery_query": "gaming shorts", "topic": "gaming",
+        "score": 80, "rank": 1,
+        "ranking": {"evidence": "Transparent ranking evidence."},
+        "media_path": str(media),
+    }
+
+
+def test_reference_candidate_page_token_media_and_decisions(tmp_path):
+    with running_server(tmp_path) as (server, _, _):
+        queue = ReferenceCandidateQueue(tmp_path / "reference-candidates.json")
+        queue.upsert_discovered([reference_candidate(tmp_path)])
+        service = FakeReferenceDiscovery(queue)
+        server.app.reference_candidate_queue = queue
+        server.app.reference_discovery_service = service
+        status, _, body = request(server, "GET", "/reference-candidates")
+        media_status, _, media_body = request(
+            server, "GET", "/reference-media/short_one"
+        )
+        rejected, headers, _ = post(
+            server, "/reference-candidates/short_one/decision",
+            {
+                "form_token": "test-token", "action": "reject",
+                "category": "gaming_highlight", "note": "repost",
+            },
+        )
+        queue.decide("short_one", "discovered")
+        accepted, _, _ = post(
+            server, "/reference-candidates/short_one/decision",
+            {
+                "form_token": "test-token", "action": "accept",
+                "category": "personality_reaction", "note": "complete beat",
+            },
+        )
+    text = body.decode()
+    assert status == 200
+    assert "Gaming &amp; reaction" in text
+    assert 'name="form_token" value="test-token"' in text
+    assert "Transparent ranking evidence" in text
+    assert media_status == 200 and media_body == b"reference-media"
+    assert rejected == 303 and "reference-candidates" in headers["Location"]
+    assert accepted == 303
+    assert service.accepted == [
+        ("short_one", "personality_reaction", "complete beat", False)
+    ]
+    assert queue.get("short_one")["status"] == "accepted"
+
+
+def test_reference_candidate_form_rejects_bad_token(tmp_path):
+    with running_server(tmp_path) as (server, _, _):
+        queue = ReferenceCandidateQueue(tmp_path / "reference-candidates.json")
+        queue.upsert_discovered([reference_candidate(tmp_path)])
+        server.app.reference_candidate_queue = queue
+        status, _, _ = post(
+            server, "/reference-candidates/short_one/decision",
+            {"form_token": "wrong", "action": "reject"},
+        )
+    assert status == 403
+    assert queue.get("short_one")["status"] == "discovered"
+
+
+def test_reference_media_cannot_escape_discovery_directory(tmp_path):
+    outside = tmp_path.parent / "outside-reference-candidate.mp4"
+    outside.write_bytes(b"must-not-be-served")
+    try:
+        with running_server(tmp_path) as (server, _, _):
+            queue = ReferenceCandidateQueue(tmp_path / "reference-candidates.json")
+            item = reference_candidate(tmp_path)
+            item["media_path"] = str(outside)
+            queue.upsert_discovered([item])
+            server.app.reference_candidate_queue = queue
+            status, _, body = request(
+                server, "GET", "/reference-media/short_one"
+            )
+        assert status == 404
+        assert b"must-not-be-served" not in body
+    finally:
+        outside.unlink(missing_ok=True)
 
 
 def test_sections_sort_and_filters(tmp_path):
