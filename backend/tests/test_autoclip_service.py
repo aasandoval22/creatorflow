@@ -204,7 +204,10 @@ def test_management_command_construction(tmp_path):
     ) in commands.commands
 
 
-def test_status_and_health_reporting(tmp_path):
+def test_status_and_health_reporting(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        autoclip_service, "DEFAULT_PRODUCTION_ROOT", tmp_path / "production"
+    )
     service, _ = manager(tmp_path)
     log = tmp_path / "production.jsonl"
     log.write_text(
