@@ -6,6 +6,7 @@ import argparse
 import hmac
 import html
 import ipaddress
+import json
 import secrets
 import socket
 import sys
@@ -23,6 +24,9 @@ from backend.services.clip_review_queue import (
     DEFAULT_REVIEW_QUEUE_PATH, REVIEW_STATUSES, ClipReviewQueue, ReviewQueueError,
 )
 from backend.services.clip_timing_adjustment import ClipTimingAdjustmentService
+from backend.services.reference_clip_comparator import ReferenceClipComparator
+from backend.services.reference_clip_library import ReferenceClipLibrary
+from backend.services.reference_profile_builder import ReferenceProfileBuilder
 from backend.services.video_manifest import DEFAULT_MANIFEST_PATH
 from backend.services.video_preview_renderer import (
     DEFAULT_PREVIEW_DIRECTORY, SAFE_PRESETS, CaptionConfiguration,
@@ -67,6 +71,8 @@ class ReviewApplication:
     timing_service: ClipTimingAdjustmentService
     form_token: str
     maximum_duration: float = 60.0
+    reference_comparator: ReferenceClipComparator | None = None
+    reference_profile: str = "personality_reaction"
 
 
 class ReviewHTTPServer(ThreadingHTTPServer):
@@ -155,8 +161,10 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 message = self._adjust(review_id, form)
             elif action == "reset-timing":
                 message = self._reset(review_id, form)
-            else:
+            elif action == "reapply-context":
                 message = self._reapply_context(review_id, form)
+            else:
+                message = self._compare_reference(review_id)
         except RequestError as error:
             self._text(error.status, error.message)
             return
@@ -186,7 +194,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
     def _write_route(path: str) -> tuple[str, str] | None:
         parts = path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "reviews" and parts[2] in {
-            "decision", "adjust", "reset-timing", "reapply-context"
+            "decision", "adjust", "reset-timing", "reapply-context",
+            "compare-reference",
         }:
             review_id = parts[1]
             if review_id and "/" not in review_id and review_id.startswith("review_"):
@@ -334,6 +343,19 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             f"{result.render_end:.3f}s. It is pending review."
         )
 
+    def _compare_reference(self, review_id: str) -> str:
+        comparator = self.server.app.reference_comparator
+        if comparator is None:
+            raise ReviewQueueError("Reference comparison is not configured.")
+        item = self.server.app.queue.find_by_review_id(review_id)
+        if item is None:
+            raise RequestError(HTTPStatus.NOT_FOUND, "That review no longer exists.")
+        comparator.compare(self.server.app.reference_profile, item, write=True)
+        return (
+            f"{review_id} compared locally against "
+            f"{self.server.app.reference_profile}; review state was unchanged."
+        )
+
     def _redirect(self, kind: str, message: str) -> None:
         location = "/?" + urlencode({kind: message})
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -361,6 +383,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             body = render_index(
                 _sorted(items), document["updated_at"], self.server.app.form_token,
                 maximum_duration=self.server.app.maximum_duration,
+                comparison_reports=self._comparison_reports(items),
                 notice=parameters.get("success", parameters.get("error", [None]))[0],
                 notice_error="error" in parameters,
             ).encode()
@@ -371,6 +394,24 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         self._headers(HTTPStatus.OK, "text/html; charset=utf-8", len(body))
         if not head:
             self.wfile.write(body)
+
+    def _comparison_reports(self, items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        comparator = self.server.app.reference_comparator
+        if comparator is None:
+            return {}
+        reports = {}
+        for item in items:
+            try:
+                path = comparator.report_path(
+                    self.server.app.reference_profile, item["review_id"]
+                )
+                if path.is_file():
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(value, dict) and value.get("review_id") == item["review_id"]:
+                        reports[item["review_id"]] = value
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+        return reports
 
     def _media(self, review_id: str, *, head: bool) -> None:
         item = self.server.app.queue.find_by_review_id(review_id)
@@ -457,11 +498,16 @@ def render_index(
     items: list[dict[str, Any]], updated_at: str, form_token: str, *,
     maximum_duration: float = 60.0,
     notice: str | None = None, notice_error: bool = False,
+    comparison_reports: dict[str, dict[str, Any]] | None = None,
 ) -> str:
+    comparison_reports = comparison_reports or {}
     sections: list[str] = []
     for status in ("pending", "approved", "rejected"):
         cards = [
-            _card(item, form_token, maximum_duration)
+            _card(
+                item, form_token, maximum_duration,
+                comparison_reports.get(item["review_id"]),
+            )
             for item in items if item["status"] == status
         ]
         sections.append(
@@ -498,7 +544,10 @@ textarea{{width:100%;min-height:5rem}}fieldset{{margin:.8rem 0;padding:.8rem}}la
 """
 
 
-def _card(item: dict[str, Any], token: str, maximum_duration: float) -> str:
+def _card(
+    item: dict[str, Any], token: str, maximum_duration: float,
+    comparison: dict[str, Any] | None = None,
+) -> str:
     review_id = quote(str(item["review_id"]), safe="")
     adjusted = bool(
         item["timing_revision"]
@@ -509,6 +558,7 @@ def _card(item: dict[str, Any], token: str, maximum_duration: float) -> str:
         if adjusted and item["status"] == "pending" else ""
     )
     hidden = f'<input type="hidden" name="form_token" value="{_e(token)}">'
+    comparison_html = _comparison_section(comparison)
     return f"""<article class="card"><div>
 <video controls preload="metadata" src="/media/{review_id}">Your browser cannot play this local preview.</video>
 </div><div><h3>Rank {_e(item['candidate_rank'])} · score {_e(item['candidate_score'])}</h3>
@@ -527,6 +577,11 @@ def _card(item: dict[str, Any], token: str, maximum_duration: float) -> str:
 <strong>Timing-adjusted:</strong> {'Yes' if adjusted else 'No'} ·
 <strong>Later manually adjusted:</strong> {'Yes' if item['timing_source'] == 'manual' else 'No'}<br>
 <strong>Preview metadata path:</strong> {_e(item['preview_metadata_path'])}</p>{pending_adjusted}
+{comparison_html}
+<form method="post" action="/reviews/{review_id}/compare-reference"><fieldset>
+<legend>Reference comparison</legend>{hidden}
+<p>Runs measurable and transcript-heuristic comparison locally. It does not rerender or change review state.</p>
+<button type="submit">Compare to Reference Profile</button></fieldset></form>
 <form method="post" action="/reviews/{review_id}/decision"><fieldset><legend>Review decision</legend>{hidden}
 <label>Review note (maximum {MAX_NOTE} characters)
 <textarea name="note" maxlength="{MAX_NOTE}">{_e(item['review_note'] or '')}</textarea></label>
@@ -555,6 +610,28 @@ Use either relative or absolute fields, not both.</p><div class="timing-grid">
 </div></article>"""
 
 
+def _comparison_section(report: dict[str, Any] | None) -> str:
+    if not report:
+        return "<section><h4>Reference comparison</h4><p>No local comparison report exists.</p></section>"
+    findings = report.get("findings", {})
+    labels = (
+        ("duration_fit", "Duration"), ("opening_context", "Opening context"),
+        ("payoff_completion", "Payoff completion"), ("ending_tail", "Ending tail"),
+        ("layout", "Layout"),
+    )
+    rows = "".join(
+        f"<li><strong>{_e(label)}:</strong> {_e(findings.get(key, {}).get('status'))}"
+        f" — {_e(findings.get(key, {}).get('evidence'))}</li>"
+        for key, label in labels
+    )
+    return (
+        "<section><h4>Reference comparison</h4>"
+        f"<p><strong>Reference profile:</strong> {_e(report.get('profile_name'))}<br>"
+        f"<strong>Profile confidence:</strong> {_e(report.get('profile_confidence'))}</p>"
+        f"<ul>{rows}</ul></section>"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve the interactive local clip-review page.")
     parser.add_argument("--host", default="127.0.0.1")
@@ -577,6 +654,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--caption-max-duration", type=positive_number, default=2.5)
     parser.add_argument("--ffmpeg-path", default="ffmpeg")
     parser.add_argument("--ffprobe-path", default="ffprobe")
+    parser.add_argument("--reference-profile", default="personality_reaction")
     return parser
 
 
@@ -599,7 +677,13 @@ def create_application(args: argparse.Namespace) -> ReviewApplication:
     service = ClipTimingAdjustmentService(
         queue, renderer, maximum_duration=args.maximum_render_duration
     )
-    return ReviewApplication(queue, service, secrets.token_urlsafe(32), args.maximum_render_duration)
+    comparator = ReferenceClipComparator(
+        ReferenceProfileBuilder(ReferenceClipLibrary())
+    )
+    return ReviewApplication(
+        queue, service, secrets.token_urlsafe(32), args.maximum_render_duration,
+        comparator, args.reference_profile,
+    )
 
 
 def main(argv: Sequence[str] | None = ()) -> int:
