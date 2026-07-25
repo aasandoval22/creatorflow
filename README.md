@@ -98,8 +98,9 @@ decode real media, or perform real transcription.
 
 ## Transcript clip-candidate analysis
 
-CreatorFlow's local workflow is ingestion → transcription → clip-candidate
-generation. Analyze all eligible downloaded videos with completed transcripts:
+CreatorFlow's local workflow is ingestion → transcription → candidate analysis
+→ local preview rendering. Analyze all eligible downloaded videos with
+completed transcripts:
 
 ```bash
 python -m backend.app.analyze_clips
@@ -131,3 +132,36 @@ upload, or publish video. Add `--show-score-breakdown` to print each returned
 candidate's ending classification, component scores, positive reasons, and
 penalties. Displayed components sum to the displayed total within a 0.1
 rounding tolerance. Normal output is unchanged when the flag is omitted.
+
+## Local vertical preview rendering
+
+Preview rendering requires `ffmpeg` and `ffprobe` on `PATH` (or explicit paths
+passed with `--ffmpeg-path` and `--ffprobe-path`). CreatorFlow does not install
+these system tools. Render the top-ranked candidate:
+
+```bash
+python -m backend.app.render_preview --video-id VIDEO_ID
+python -m backend.app.render_preview --video-id VIDEO_ID --rank 2
+python -m backend.app.render_preview --video-id VIDEO_ID --candidate-id CANDIDATE_ID
+```
+
+Inspect and validate the command without rendering, render without captions,
+replace an existing valid preview, or choose a custom even-sized canvas:
+
+```bash
+python -m backend.app.render_preview --video-id VIDEO_ID --dry-run
+python -m backend.app.render_preview --video-id VIDEO_ID --no-captions
+python -m backend.app.render_preview --video-id VIDEO_ID --force
+python -m backend.app.render_preview --video-id VIDEO_ID --width 720 --height 1280
+```
+
+The default output is
+`data/previews/<video_id>/<candidate_id>/preview.mp4`, with verified,
+versioned metadata in the adjacent `preview.json`. The 1080×1920 composition
+uses a center-cropped, darkened, blurred copy of the source as its background
+and centers an uncropped, aspect-ratio-preserving source image in front.
+Captions are generated from local transcript timing and burned into the video.
+The original audio is retained when present.
+
+Rendering, probing, caption generation, and artifact storage remain entirely
+local. This command does not upload, publish, post, or call a platform API.

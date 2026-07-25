@@ -30,6 +30,7 @@ data/transcripts/
 data/transcripts/**/.*.tmp
 data/clip_candidates/
 data/clip_candidates/**/.*.tmp
+data/previews/
 data/models/
 .cache/huggingface/
 .cache/whisper/
@@ -37,6 +38,10 @@ data/models/
 # Temporary files
 *.tmp
 *.part
+*.tmp.mp4
+*.tmp.ass
+.captions.*
+.preview.json.*
 
 # macOS
 .DS_Store
