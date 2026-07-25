@@ -14,6 +14,7 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -37,7 +38,9 @@ DEFAULT_MEDIA_ROOT = DEFAULT_ROOT / "media"
 DEFAULT_REFERENCE_ROOT = PROJECT_ROOT / "data" / "reference_clips"
 DEFAULT_ENVIRONMENT_FILE = Path.home() / ".config" / "creatorflow" / "creatorflow.env"
 QUEUE_VERSION = 1
-SCORE_VERSION = 1
+SCORE_VERSION = 2
+RELEVANCE_VERSION = 1
+SOURCE_QUALITY_VERSION = 1
 STATUSES = frozenset({"discovered", "accepted", "rejected", "duplicate"})
 DEFAULT_QUERIES = (
     "gaming funny moments shorts",
@@ -47,12 +50,66 @@ DEFAULT_QUERIES = (
     "gaming challenge shorts",
     "horror game reaction shorts",
 )
-TOPIC_HINTS = (
-    "fortnite", "minecraft", "valorant", "call of duty", "cod", "roblox",
-    "clash royale", "gta", "grand theft auto", "apex", "overwatch",
-    "league of legends", "rocket league", "counter strike", "cs2",
-)
 TOKEN = re.compile(r"[a-z0-9]+")
+GAME_TOPIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "fnaf": ("five nights at freddy's", "five nights at freddys", "fnaf"),
+    "call-of-duty": ("call of duty", "warzone", "cod"),
+    "destiny-2": ("destiny 2", "destiny ii", "destiny"),
+    "roblox": ("roblox",),
+    "fortnite": ("fortnite", "victory royale"),
+    "minecraft": ("minecraft",),
+    "valorant": ("valorant",),
+    "clash-royale": ("clash royale",),
+    "grand-theft-auto": ("grand theft auto", "gta 5", "gta v", "gta"),
+    "apex-legends": ("apex legends", "apex"),
+    "overwatch": ("overwatch 2", "overwatch"),
+    "league-of-legends": ("league of legends",),
+    "rocket-league": ("rocket league",),
+    "counter-strike": ("counter strike 2", "counter-strike 2", "cs2"),
+    "marvel-rivals": ("marvel rivals",),
+    "dead-by-daylight": ("dead by daylight", "dbd"),
+    "among-us": ("among us",),
+    "rainbow-six-siege": ("rainbow six siege", "r6 siege"),
+}
+GAMEPLAY_TERMS = frozenset(
+    {
+        "boss fight", "clutch", "controller", "esports", "gameplay", "gamer",
+        "gaming", "headshot", "killstreak", "let s play", "loadout", "lobby",
+        "matchmaking", "multiplayer", "playthrough", "ranked match", "speedrun",
+        "speedrunning", "video game",
+    }
+)
+GAMING_TAGS = frozenset(
+    {
+        "esports", "fps", "gameplay", "gamer", "gaming", "gaming shorts",
+        "let s play", "rpg", "speedrun", "stream highlights", "video games",
+    }
+)
+GENERIC_TITLE_WORDS = frozenset(
+    {
+        "clip", "clips", "even", "funniest", "funny", "gaming", "guess",
+        "moment", "moments", "ranking", "reaction", "short", "shorts", "top",
+        "video", "viral",
+    }
+)
+COMPILATION_MARKERS = (
+    "best of", "clip compilation", "clips compilation", "compilation",
+)
+RANKING_MARKERS = (
+    "ranking ", "ranked from", "top 3", "top three", "top 5", "top five",
+    "top 10", "top ten",
+)
+REPOST_MARKERS = (
+    "all credit goes to", "credit to original", "credits to", "not my clip",
+    "not mine", "re-upload", "reupload", "repost",
+)
+MULTI_SOURCE_MARKERS = (
+    "clips from", "different creators", "various creators",
+)
+NON_GAMING_TITLE_MARKERS = (
+    "animal", "celebrity", "cooking", "couple", "cricket", "dance",
+    "kpop", "makeup", "prank", "recipe", "school", "trampoline", "unboxing",
+)
 
 
 class ReferenceDiscoveryError(RuntimeError):
@@ -104,19 +161,294 @@ def parse_iso_duration(value: str) -> float:
     )
 
 
-def infer_topic(title: str, query: str) -> str:
-    haystack = f"{title} {query}".casefold()
-    for topic in TOPIC_HINTS:
-        if topic in haystack:
-            return topic.replace(" ", "_")
-    tokens = [token for token in TOKEN.findall(title.casefold()) if len(token) > 3]
-    ignored = {"shorts", "gaming", "funny", "moment", "moments", "video", "game"}
-    return next((token for token in tokens if token not in ignored), "general_gaming")
+def _normalized_text(value: Any) -> str:
+    return " ".join(TOKEN.findall(str(value or "").casefold()))
+
+
+def _metadata_text(candidate: Mapping[str, Any], *, include_query: bool) -> str:
+    tags = candidate.get("tags")
+    tag_values = tags if isinstance(tags, list) else []
+    values = [
+        candidate.get("title"),
+        candidate.get("description"),
+        *tag_values,
+    ]
+    if include_query:
+        values.append(candidate.get("discovery_query"))
+    return " ".join(_normalized_text(value) for value in values if value)
+
+
+def _contains_phrase(text: str, phrase: str) -> bool:
+    normalized = _normalized_text(phrase)
+    return bool(normalized and f" {normalized} " in f" {text} ")
+
+
+def infer_topic(
+    candidate_or_title: Mapping[str, Any] | str,
+    query: str = "",
+) -> str:
+    """Infer a maintainable game slug, never a generic title word."""
+
+    if isinstance(candidate_or_title, Mapping):
+        candidate = candidate_or_title
+    else:
+        candidate = {
+            "title": candidate_or_title,
+            "description": "",
+            "tags": [],
+            "discovery_query": query,
+        }
+    aliases = sorted(
+        (
+            (topic, alias)
+            for topic, topic_aliases in GAME_TOPIC_ALIASES.items()
+            for alias in topic_aliases
+        ),
+        key=lambda value: len(_normalized_text(value[1])),
+        reverse=True,
+    )
+    tags = candidate.get("tags")
+    sources = [
+        candidate.get("title"),
+        " ".join(tags) if isinstance(tags, list) else "",
+        candidate.get("description"),
+        candidate.get("discovery_query"),
+    ]
+    for source in sources:
+        text = _normalized_text(source)
+        for topic, alias in aliases:
+            if _contains_phrase(text, alias):
+                return topic
+    return "unknown-gaming"
 
 
 def normalized_title(title: str) -> str:
-    ignored = {"short", "shorts", "gaming", "clip", "viral"}
-    return " ".join(token for token in TOKEN.findall(title.casefold()) if token not in ignored)
+    return " ".join(
+        token for token in TOKEN.findall(title.casefold())
+        if token not in GENERIC_TITLE_WORDS
+    )
+
+
+def near_duplicate_title(first: str, second: str) -> bool:
+    left = normalized_title(first)
+    right = normalized_title(second)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    left_tokens = set(left.split())
+    right_tokens = set(right.split())
+    overlap = len(left_tokens & right_tokens) / max(
+        1, len(left_tokens | right_tokens)
+    )
+    return (
+        min(len(left_tokens), len(right_tokens)) >= 3
+        and (
+            overlap >= 0.8
+            or SequenceMatcher(None, left, right).ratio() >= 0.9
+        )
+    )
+
+
+def evaluate_gaming_relevance(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Return deterministic, inspectable metadata evidence for gaming."""
+
+    category_id = str(candidate.get("category_id") or "")
+    metadata_text = _metadata_text(candidate, include_query=False)
+    title_text = _normalized_text(candidate.get("title"))
+    query_text = _normalized_text(candidate.get("discovery_query"))
+    topic = infer_topic(candidate)
+    recognized_game = topic != "unknown-gaming" and any(
+        _contains_phrase(metadata_text, alias)
+        for alias in GAME_TOPIC_ALIASES[topic]
+    )
+    gameplay_terms = sorted(
+        term for term in GAMEPLAY_TERMS
+        if _contains_phrase(metadata_text, term)
+    )
+    title_gameplay_terms = sorted(
+        term for term in GAMEPLAY_TERMS
+        if _contains_phrase(title_text, term)
+    )
+    title_topic = infer_topic(
+        {
+            "title": candidate.get("title"),
+            "description": "",
+            "tags": [],
+            "discovery_query": "",
+        }
+    )
+    non_gaming_title_markers = sorted(
+        marker for marker in NON_GAMING_TITLE_MARKERS
+        if _contains_phrase(title_text, marker)
+    )
+    tags = candidate.get("tags")
+    tag_values = tags if isinstance(tags, list) else []
+    normalized_tags = {
+        _normalized_text(tag) for tag in tag_values
+        if isinstance(tag, str)
+    }
+    gaming_tags = sorted(
+        tag for tag in normalized_tags
+        if tag in GAMING_TAGS
+        or any(_contains_phrase(tag, term) for term in GAMEPLAY_TERMS)
+    )
+    gaming_query = any(
+        _contains_phrase(query_text, term)
+        for term in ("gaming", "gameplay", "game", "streamer")
+    )
+
+    positive: list[str] = []
+    penalties: list[str] = []
+    score = 0.0
+    if category_id == "20":
+        positive.append("YouTube category 20 (Gaming).")
+        score += 12
+    elif category_id:
+        penalties.append(f"YouTube category {category_id} is not Gaming.")
+        score -= 2
+    else:
+        penalties.append("YouTube category is unavailable.")
+        score -= 1
+    if recognized_game:
+        positive.append(f"Recognized game metadata maps to {topic}.")
+        score += 10
+    if gameplay_terms:
+        positive.append(
+            "Gaming terminology in metadata: "
+            + ", ".join(gameplay_terms[:5])
+            + "."
+        )
+        score += min(6, 2 + len(gameplay_terms))
+    if gaming_tags:
+        positive.append(
+            "Gaming-specific tags: " + ", ".join(gaming_tags[:5]) + "."
+        )
+        score += min(5, 2 + len(gaming_tags))
+    if gaming_query and (recognized_game or gameplay_terms or gaming_tags):
+        positive.append(
+            "Gaming-specific query is corroborated by video metadata."
+        )
+        score += 2
+    elif gaming_query:
+        penalties.append(
+            "Gaming search query has no corroborating gaming metadata."
+        )
+
+    metadata_signal = bool(recognized_game or gameplay_terms or gaming_tags)
+    eligible = category_id == "20" or metadata_signal
+    exclusion_reasons: list[str] = []
+    if category_id == "24" and not metadata_signal:
+        eligible = False
+        exclusion_reasons.append(
+            "Entertainment-category result lacks explicit gaming metadata."
+        )
+    elif not eligible:
+        exclusion_reasons.append(
+            "No positive gaming evidence exists outside the discovery query."
+        )
+    if (
+        category_id != "20"
+        and non_gaming_title_markers
+        and title_topic == "unknown-gaming"
+        and not title_gameplay_terms
+    ):
+        eligible = False
+        marker_list = ", ".join(non_gaming_title_markers)
+        penalties.append(
+            f"Explicit non-gaming title subject: {marker_list}."
+        )
+        exclusion_reasons.append(
+            "Non-Gaming-category title has an explicit unrelated subject; "
+            "lower-priority tags or description cannot override it."
+        )
+
+    return {
+        "version": RELEVANCE_VERSION,
+        "eligible": eligible,
+        "score": round(max(0.0, score), 4),
+        "category_id": category_id or None,
+        "topic": topic if eligible else None,
+        "positive_evidence": positive,
+        "penalties": penalties,
+        "exclusion_reasons": exclusion_reasons,
+        "evidence": " ".join(
+            positive + penalties + exclusion_reasons
+        ),
+    }
+
+
+def evaluate_source_quality(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Flag derivative-source risk without pretending to prove authorship."""
+
+    metadata_text = _metadata_text(candidate, include_query=False)
+    ranking_markers = sorted(
+        marker for marker in RANKING_MARKERS
+        if _contains_phrase(metadata_text, marker)
+    )
+    compilation_markers = sorted(
+        marker for marker in COMPILATION_MARKERS
+        if _contains_phrase(metadata_text, marker)
+    )
+    repost_markers = sorted(
+        marker for marker in REPOST_MARKERS
+        if _contains_phrase(metadata_text, marker)
+    )
+    multi_source_markers = sorted(
+        marker for marker in MULTI_SOURCE_MARKERS
+        if _contains_phrase(metadata_text, marker)
+    )
+    penalties: list[dict[str, Any]] = []
+    if ranking_markers:
+        penalties.append(
+            {
+                "points": -6.0,
+                "reason": "Ranking-format title may aggregate derivative clips.",
+            }
+        )
+    if compilation_markers:
+        penalties.append(
+            {
+                "points": -10.0,
+                "reason": "Compilation wording weakens original-source confidence.",
+            }
+        )
+    if repost_markers:
+        penalties.append(
+            {
+                "points": -20.0,
+                "reason": "Explicit repost or third-party credit wording detected.",
+            }
+        )
+
+    exclusion_reasons: list[str] = []
+    if repost_markers:
+        exclusion_reasons.append(
+            "Explicit repost wording indicates this is not a preferred original upload."
+        )
+    if ranking_markers and multi_source_markers:
+        exclusion_reasons.append(
+            "Ranking appears assembled from multiple creators."
+        )
+    penalty = round(
+        sum(float(item["points"]) for item in penalties),
+        4,
+    )
+    return {
+        "version": SOURCE_QUALITY_VERSION,
+        "eligible": not exclusion_reasons,
+        "status": (
+            "excluded-derivative"
+            if exclusion_reasons
+            else "derivative-risk" if penalties else "preferred-original"
+        ),
+        "penalty": penalty,
+        "penalties": penalties,
+        "exclusion_reasons": exclusion_reasons,
+        "evidence": " ".join(
+            [item["reason"] for item in penalties] + exclusion_reasons
+        ) or "No compilation, ranking, or repost markers detected.",
+    }
 
 
 def views_per_day(views: int, published_at: str, *, now: datetime | None = None) -> float:
@@ -227,8 +559,17 @@ class YouTubeDataAPI:
                         "video_id": video_id,
                         "source_url": f"https://www.youtube.com/watch?v={video_id}",
                         "title": str(snippet.get("title") or ""),
+                        "description": str(snippet.get("description") or ""),
+                        "tags": [
+                            str(tag) for tag in snippet.get("tags", [])
+                            if isinstance(tag, str)
+                        ] if isinstance(snippet.get("tags"), list) else [],
                         "creator": str(snippet.get("channelTitle") or ""),
+                        "channel_title": str(
+                            snippet.get("channelTitle") or ""
+                        ),
                         "channel_id": str(snippet.get("channelId") or ""),
+                        "category_id": str(snippet.get("categoryId") or ""),
                         "published_at": str(snippet.get("publishedAt") or ""),
                         "view_count": views,
                         "like_count": _optional_int(statistics.get("likeCount")),
@@ -383,43 +724,385 @@ def _frame_rate(value: Any) -> float | None:
         return None
 
 
+COHORT_WEIGHTS: dict[str, dict[str, float]] = {
+    "established": {
+        "raw_views": 30,
+        "views_per_day": 8,
+        "like_ratio": 12,
+        "comment_ratio": 8,
+        "recency": 4,
+        "duration": 8,
+        "vertical": 12,
+        "gaming_relevance": 14,
+    },
+    "breakout": {
+        "raw_views": 10,
+        "views_per_day": 30,
+        "like_ratio": 12,
+        "comment_ratio": 8,
+        "recency": 16,
+        "duration": 8,
+        "vertical": 12,
+        "gaming_relevance": 14,
+    },
+}
+
+
+def _exclusion(
+    candidate: Mapping[str, Any],
+    stage: str,
+    reason: str,
+    *,
+    evidence: str = "",
+) -> dict[str, Any]:
+    return {
+        "video_id": candidate.get("video_id"),
+        "title": candidate.get("title"),
+        "creator": candidate.get("creator"),
+        "stage": stage,
+        "reason": reason,
+        "evidence": evidence or reason,
+    }
+
+
+def qualify_metadata_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Apply relevance, source-quality, and near-duplicate gates."""
+
+    prepared: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for original in candidates:
+        item = copy.deepcopy(dict(original))
+        relevance = evaluate_gaming_relevance(item)
+        source_quality = evaluate_source_quality(item)
+        item["gaming_relevance"] = relevance
+        item["source_quality"] = source_quality
+        item["topic"] = item.get("topic") or relevance.get("topic")
+        item["validation_status"] = "metadata-qualified"
+        item["media_verification"] = "provisional"
+        item["validation_evidence"] = (
+            "Gaming relevance is metadata-qualified; vertical, duration, "
+            "video, and audio evidence remain provisional until local media "
+            "validation."
+        )
+        if not relevance["eligible"]:
+            excluded.append(
+                _exclusion(
+                    item,
+                    "gaming-relevance",
+                    "; ".join(relevance["exclusion_reasons"]),
+                    evidence=relevance["evidence"],
+                )
+            )
+            continue
+        if not source_quality["eligible"]:
+            excluded.append(
+                _exclusion(
+                    item,
+                    "source-quality",
+                    "; ".join(source_quality["exclusion_reasons"]),
+                    evidence=source_quality["evidence"],
+                )
+            )
+            continue
+        prepared.append(item)
+
+    preferred = sorted(
+        prepared,
+        key=lambda item: (
+            -float(item["source_quality"]["penalty"]),
+            -int(item.get("view_count") or 0),
+            str(item.get("video_id") or ""),
+        ),
+    )
+    unique: list[dict[str, Any]] = []
+    for item in preferred:
+        duplicate = next(
+            (
+                kept for kept in unique
+                if near_duplicate_title(item.get("title", ""), kept.get("title", ""))
+            ),
+            None,
+        )
+        if duplicate is not None:
+            excluded.append(
+                _exclusion(
+                    item,
+                    "deduplication",
+                    f"Near-duplicate title of {duplicate['video_id']}; "
+                    "the higher-confidence source was retained.",
+                    evidence=(
+                        f"Normalized titles are substantially similar. "
+                        f"Retained source status: "
+                        f"{duplicate['source_quality']['status']}."
+                    ),
+                )
+            )
+            continue
+        unique.append(item)
+    return unique, excluded
+
+
 def score_candidate(
-    candidate: Mapping[str, Any], *, now: datetime | None = None,
+    candidate: Mapping[str, Any], *, cohort: str = "established",
+    now: datetime | None = None,
 ) -> tuple[float, dict[str, Any]]:
+    if cohort not in COHORT_WEIGHTS:
+        raise ValueError(f"Unsupported benchmark cohort {cohort!r}.")
     now = now or datetime.now(timezone.utc)
+    weights = COHORT_WEIGHTS[cohort]
     views = max(0, int(candidate.get("view_count") or 0))
     daily = views_per_day(views, candidate["published_at"], now=now)
     likes, comments = candidate.get("like_count"), candidate.get("comment_count")
-    duration = float(candidate.get("verified_duration") or candidate.get("duration") or 0)
+    duration_value = candidate.get("verified_duration")
+    if duration_value is None:
+        duration_value = candidate.get("duration")
+    duration = float(duration_value or 0)
     vertical = candidate.get("verified_vertical")
-    age_days = max((now - _utc(candidate["published_at"])).total_seconds() / 86400, 1)
+    age_days = max(
+        (now - _utc(candidate["published_at"])).total_seconds() / 86400,
+        1,
+    )
+    relevance = candidate.get("gaming_relevance")
+    if not isinstance(relevance, Mapping):
+        relevance = evaluate_gaming_relevance(candidate)
+    source_quality = candidate.get("source_quality")
+    if not isinstance(source_quality, Mapping):
+        source_quality = evaluate_source_quality(candidate)
     components = {
-        "raw_views": min(22.0, math.log10(views + 1) / 8 * 22),
-        "views_per_day": min(24.0, math.log10(daily + 1) / 6 * 24),
-        "like_ratio": min(12.0, (likes / views * 240) if likes is not None and views else 0),
-        "comment_ratio": min(
-            8.0, (comments / views * 800) if comments is not None and views else 0
+        "raw_views": min(
+            weights["raw_views"],
+            math.log10(views + 1) / 8 * weights["raw_views"],
         ),
-        "recency": max(0.0, 12.0 * (1 - min(age_days, 365) / 365)),
-        "duration": 10.0 if 10 <= duration <= 90 else (5.0 if 5 <= duration <= 180 else 0.0),
-        "vertical": 10.0 if vertical is True else 0.0,
+        "views_per_day": min(
+            weights["views_per_day"],
+            math.log10(daily + 1) / 6 * weights["views_per_day"],
+        ),
+        "like_ratio": min(
+            weights["like_ratio"],
+            (
+                likes / views * weights["like_ratio"] * 20
+                if likes is not None and views else 0
+            ),
+        ),
+        "comment_ratio": min(
+            weights["comment_ratio"],
+            (
+                comments / views * weights["comment_ratio"] * 100
+                if comments is not None and views else 0
+            ),
+        ),
+        "recency": max(
+            0.0,
+            weights["recency"] * (1 - min(age_days, 365) / 365),
+        ),
+        "duration": (
+            weights["duration"]
+            if 10 <= duration <= 90
+            else weights["duration"] / 2 if 5 <= duration <= 180 else 0.0
+        ),
+        "vertical": weights["vertical"] if vertical is True else 0.0,
+        "gaming_relevance": min(
+            weights["gaming_relevance"],
+            float(relevance.get("score") or 0)
+            / 12
+            * weights["gaming_relevance"],
+        ),
         "creator_diversity": 0.0,
         "topic_diversity": 0.0,
+        "source_quality_penalty": float(
+            source_quality.get("penalty") or 0
+        ),
         "evidence_penalty": -4.0 * sum(
             value is None for value in (likes, comments, vertical)
         ),
     }
     total = round(max(0.0, sum(components.values())), 4)
+    verification = candidate.get("validation_status") or "metadata-qualified"
     explanation = {
-        "version": SCORE_VERSION, "total": total,
-        "components": {name: round(value, 4) for name, value in components.items()},
+        "version": SCORE_VERSION,
+        "cohort": cohort,
+        "total": total,
+        "components": {
+            name: round(value, 4) for name, value in components.items()
+        },
         "evidence": (
-            f"{views:,} views; {daily:,.1f} views/day; "
-            f"duration {duration:.1f}s; vertical={vertical!r}. "
-            "This transparent ranking is not a prediction of virality or objective quality."
+            f"{cohort.title()} cohort; {views:,} views; "
+            f"{daily:,.1f} views/day; duration {duration:.1f}s; "
+            f"vertical={vertical!r}; validation={verification}. "
+            f"Gaming evidence: {relevance.get('evidence') or 'unavailable'} "
+            f"Source evidence: {source_quality.get('evidence') or 'unavailable'} "
+            "This transparent ranking is not a prediction of virality or "
+            "objective quality."
         ),
     }
     return total, explanation
+
+
+@dataclass(frozen=True)
+class BenchmarkSelection:
+    selected: list[dict[str, Any]]
+    excluded: list[dict[str, Any]]
+
+
+def select_benchmark_cohorts(
+    candidates: Sequence[dict[str, Any]], *,
+    established_count: int = 10,
+    breakout_count: int = 10,
+    max_per_creator: int = 2,
+    max_per_topic: int = 3,
+    now: datetime | None = None,
+) -> BenchmarkSelection:
+    """Select both cohorts while sharing creator and topic diversity caps."""
+
+    if min(
+        established_count,
+        breakout_count,
+        max_per_creator,
+        max_per_topic,
+    ) < 0 or max_per_creator < 1 or max_per_topic < 1:
+        raise ValueError("Cohort counts must be nonnegative and caps positive.")
+    cohort_names = ("established", "breakout")
+    ranked: dict[str, list[dict[str, Any]]] = {}
+    for cohort in cohort_names:
+        values = []
+        for original in candidates:
+            item = copy.deepcopy(original)
+            item["score"], item["ranking"] = score_candidate(
+                item,
+                cohort=cohort,
+                now=now,
+            )
+            values.append(item)
+        ranked[cohort] = sorted(
+            values,
+            key=lambda item: (-item["score"], item["video_id"]),
+        )
+
+    quotas = {
+        "established": established_count,
+        "breakout": breakout_count,
+    }
+    creators: dict[str, int] = {}
+    topics: dict[str, int] = {}
+    selected_ids: set[str] = set()
+    selected: list[dict[str, Any]] = []
+    progress = True
+    while progress and any(quotas.values()):
+        progress = False
+        for cohort in cohort_names:
+            if quotas[cohort] <= 0:
+                continue
+            item = next(
+                (
+                    value for value in ranked[cohort]
+                    if value["video_id"] not in selected_ids
+                    and creators.get(value["creator"].casefold(), 0)
+                    < max_per_creator
+                    and topics.get(value["topic"], 0) < max_per_topic
+                ),
+                None,
+            )
+            if item is None:
+                continue
+            creator = item["creator"].casefold()
+            topic = item["topic"]
+            creator_bonus = 2.0 if not creators.get(creator) else 0.0
+            topic_bonus = 2.0 if not topics.get(topic) else 0.0
+            item["ranking"]["components"]["creator_diversity"] = creator_bonus
+            item["ranking"]["components"]["topic_diversity"] = topic_bonus
+            item["score"] = round(
+                item["score"] + creator_bonus + topic_bonus,
+                4,
+            )
+            item["ranking"]["total"] = item["score"]
+            item["cohort"] = cohort
+            selected_ids.add(item["video_id"])
+            creators[creator] = creators.get(creator, 0) + 1
+            topics[topic] = topics.get(topic, 0) + 1
+            quotas[cohort] -= 1
+            selected.append(item)
+            progress = True
+
+    for rank, item in enumerate(selected, 1):
+        item["rank"] = rank
+
+    excluded = []
+    for item in candidates:
+        if item["video_id"] in selected_ids:
+            continue
+        creator = item["creator"].casefold()
+        topic = item["topic"]
+        if creators.get(creator, 0) >= max_per_creator:
+            reason = f"Creator diversity cap of {max_per_creator} was reached."
+        elif topics.get(topic, 0) >= max_per_topic:
+            reason = f"Topic diversity cap of {max_per_topic} was reached."
+        else:
+            reason = "Candidate ranked below the available cohort slots."
+        excluded.append(_exclusion(item, "benchmark-selection", reason))
+    return BenchmarkSelection(selected, excluded)
+
+
+def _validation_pool(
+    candidates: Sequence[dict[str, Any]], *,
+    limit: int,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    ranked: dict[str, list[dict[str, Any]]] = {}
+    for cohort in ("established", "breakout"):
+        values = []
+        for item in candidates:
+            score, _ranking = score_candidate(item, cohort=cohort, now=now)
+            values.append((score, item))
+        ranked[cohort] = [
+            item for _score, item in sorted(
+                values,
+                key=lambda value: (-value[0], value[1]["video_id"]),
+            )
+        ]
+    selected: list[dict[str, Any]] = []
+    ids: set[str] = set()
+    offset = 0
+    while len(selected) < limit:
+        progress = False
+        for cohort in ("established", "breakout"):
+            if offset >= len(ranked[cohort]):
+                continue
+            item = ranked[cohort][offset]
+            if item["video_id"] not in ids:
+                selected.append(item)
+                ids.add(item["video_id"])
+                if len(selected) >= limit:
+                    break
+            progress = True
+        if not progress:
+            break
+        offset += 1
+    return selected
+
+
+def resolve_cohort_counts(
+    *, target_count: int | None,
+    established_count: int | None,
+    breakout_count: int | None,
+) -> tuple[int, int]:
+    if established_count is not None or breakout_count is not None:
+        if target_count is not None:
+            raise ValueError(
+                "Use either target_count or explicit cohort counts, not both."
+            )
+        established = (
+            10 if established_count is None else established_count
+        )
+        breakout = 10 if breakout_count is None else breakout_count
+    else:
+        total = 20 if target_count is None else target_count
+        established = (total + 1) // 2
+        breakout = total // 2
+    if established < 0 or breakout < 0 or established + breakout < 1:
+        raise ValueError("At least one nonnegative cohort count is required.")
+    return established, breakout
 
 
 def select_diverse(
@@ -427,51 +1110,22 @@ def select_diverse(
     max_per_creator: int = 2, max_per_topic: int = 3,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    ranked = []
-    seen_titles: set[str] = set()
-    for original in candidates:
-        item = copy.deepcopy(original)
-        title_identity = normalized_title(item["title"])
-        if title_identity and title_identity in seen_titles:
-            continue
-        seen_titles.add(title_identity)
-        item["topic"] = item.get("topic") or infer_topic(
-            item["title"], item["discovery_query"]
-        )
-        item["score"], item["ranking"] = score_candidate(item, now=now)
-        ranked.append(item)
-    ranked.sort(key=lambda item: (-item["score"], item["video_id"]))
-    creators: dict[str, int] = {}
-    topics: dict[str, int] = {}
-    selected = []
-    remaining = list(ranked)
-    while remaining and len(selected) < count:
-        eligible = [
-            item for item in remaining
-            if creators.get(item["creator"].casefold(), 0) < max_per_creator
-            and topics.get(item["topic"], 0) < max_per_topic
-        ]
-        if not eligible:
-            break
-        def adjusted(item: dict[str, Any]) -> tuple[float, str]:
-            creator_bonus = 2.0 if not creators.get(item["creator"].casefold()) else 0.0
-            topic_bonus = 2.0 if not topics.get(item["topic"]) else 0.0
-            return item["score"] + creator_bonus + topic_bonus, item["video_id"]
-        item = max(eligible, key=lambda value: (adjusted(value)[0], adjusted(value)[1]))
-        remaining.remove(item)
-        creator = item["creator"].casefold()
-        topic = item["topic"]
-        creator_bonus = 2.0 if not creators.get(creator) else 0.0
-        topic_bonus = 2.0 if not topics.get(topic) else 0.0
-        item["ranking"]["components"]["creator_diversity"] = creator_bonus
-        item["ranking"]["components"]["topic_diversity"] = topic_bonus
-        item["score"] = round(item["score"] + creator_bonus + topic_bonus, 4)
-        item["ranking"]["total"] = item["score"]
-        creators[creator] = creators.get(creator, 0) + 1
-        topics[topic] = topics.get(topic, 0) + 1
-        item["rank"] = len(selected) + 1
-        selected.append(item)
-    return selected
+    """Compatibility wrapper for balanced established/breakout selection."""
+
+    qualified, _excluded = qualify_metadata_candidates(candidates)
+    established, breakout = resolve_cohort_counts(
+        target_count=count,
+        established_count=None,
+        breakout_count=None,
+    )
+    return select_benchmark_cohorts(
+        qualified,
+        established_count=established,
+        breakout_count=breakout,
+        max_per_creator=max_per_creator,
+        max_per_topic=max_per_topic,
+        now=now,
+    ).selected
 
 
 class ReferenceCandidateQueue:
@@ -539,6 +1193,16 @@ class ReferenceCandidateQueue:
                 "status": "discovered",
                 "notes": (previous or {}).get("notes"),
                 "category": (previous or {}).get("category", "gaming_highlight"),
+                "topic": (
+                    previous.get("topic")
+                    if previous
+                    and previous.get("topic_manually_corrected")
+                    else candidate.get("topic")
+                ),
+                "topic_manually_corrected": (previous or {}).get(
+                    "topic_manually_corrected",
+                    False,
+                ),
                 "accepted_reference_id": (previous or {}).get("accepted_reference_id"),
                 "created_at": (previous or {}).get("created_at", now),
                 "updated_at": now,
@@ -551,7 +1215,8 @@ class ReferenceCandidateQueue:
 
     def decide(
         self, video_id: str, status: str, *, notes: str | None = None,
-        category: str | None = None, accepted_reference_id: str | None = None,
+        category: str | None = None, topic: str | None = None,
+        accepted_reference_id: str | None = None,
     ) -> dict[str, Any]:
         if status not in STATUSES:
             raise ReferenceDiscoveryError(f"Unsupported candidate status {status!r}.")
@@ -563,6 +1228,9 @@ class ReferenceCandidateQueue:
                     item["notes"] = notes
                 if category is not None:
                     item["category"] = category
+                if topic is not None:
+                    item["topic"] = topic
+                    item["topic_manually_corrected"] = True
                 if accepted_reference_id is not None:
                     item["accepted_reference_id"] = accepted_reference_id
                 item["updated_at"] = utc_now()
@@ -580,13 +1248,20 @@ class ReferenceCandidateQueue:
             "created_at", "origin", "media_path", "validation_error",
             "verified_duration", "verified_vertical", "width", "height",
             "frame_rate", "has_video", "has_audio", "downloadable",
+            "topic_manually_corrected",
         }
         for item in document["items"]:
             update = updates.get(item["video_id"])
             if update is None:
                 continue
             for name, value in update.items():
-                if name not in protected:
+                if (
+                    name not in protected
+                    and not (
+                        name == "topic"
+                        and item.get("topic_manually_corrected")
+                    )
+                ):
                     item[name] = copy.deepcopy(value)
             item["updated_at"] = now
         document["updated_at"] = now
@@ -609,12 +1284,20 @@ class ReferenceDiscoveryService:
         self.reference_root = Path(reference_root)
 
     def discover(
-        self, *, target_count: int = 20, pool_size: int = 100,
+        self, *, target_count: int | None = None, pool_size: int = 100,
+        established_count: int | None = None,
+        breakout_count: int | None = None,
         publication_days: int = 365, region: str = "US",
         max_per_creator: int = 2, max_per_topic: int = 3,
         queries: Sequence[str] = DEFAULT_QUERIES, dry_run: bool = False,
         retain_media: str = "selected",
     ) -> dict[str, Any]:
+        established, breakout = resolve_cohort_counts(
+            target_count=target_count,
+            established_count=established_count,
+            breakout_count=breakout_count,
+        )
+        total_count = established + breakout
         after = (
             datetime.now(timezone.utc) - timedelta(days=publication_days)
         ).isoformat().replace("+00:00", "Z")
@@ -622,24 +1305,64 @@ class ReferenceDiscoveryService:
             queries, pool_size=pool_size, published_after=after, region=region
         )
         hydrated = self.api.hydrate(search)
-        prelim = sorted(
-            hydrated,
-            key=lambda item: score_candidate(
-                {**item, "verified_vertical": None}
-            )[0],
-            reverse=True,
-        )[:max(target_count * 3, target_count)]
-        planned = select_diverse(
-            [{**item, "verified_vertical": None} for item in prelim],
-            count=target_count, max_per_creator=max_per_creator,
+        qualified, metadata_exclusions = qualify_metadata_candidates(
+            [
+                {
+                    **item,
+                    "verified_vertical": None,
+                    "verified_duration": None,
+                }
+                for item in hydrated
+            ]
+        )
+        planned = select_benchmark_cohorts(
+            qualified,
+            established_count=established,
+            breakout_count=breakout,
+            max_per_creator=max_per_creator,
             max_per_topic=max_per_topic,
         )
         if dry_run:
             return {
-                "dry_run": True, "pool_count": len(hydrated),
-                "planned_count": len(planned), "selected": planned,
+                "dry_run": True,
+                "pool_count": len(hydrated),
+                "metadata_qualified_count": len(qualified),
+                "planned_count": len(planned.selected),
+                "cohorts": {
+                    "established": sum(
+                        item["cohort"] == "established"
+                        for item in planned.selected
+                    ),
+                    "breakout": sum(
+                        item["cohort"] == "breakout"
+                        for item in planned.selected
+                    ),
+                },
+                "validation_summary": {
+                    "metadata_qualified": len(qualified),
+                    "media_verified": 0,
+                    "rejected_during_media_validation": 0,
+                    "media_verification": "provisional",
+                },
+                "selected": planned.selected,
+                "exclusions": metadata_exclusions + planned.excluded,
             }
+        prelim = _validation_pool(
+            qualified,
+            limit=max(total_count * 3, total_count),
+        )
+        shortlist_ids = {item["video_id"] for item in prelim}
+        shortlist_exclusions = [
+            _exclusion(
+                item,
+                "media-validation-shortlist",
+                "Candidate ranked below the bounded media-validation shortlist.",
+            )
+            for item in qualified
+            if item["video_id"] not in shortlist_ids
+        ]
         verified = []
+        media_exclusions = []
         for item in prelim:
             evidence = self.media_validator.validate(
                 item, retain=retain_media in {"selected", "all"}
@@ -654,23 +1377,79 @@ class ReferenceDiscoveryService:
                 "verified_vertical": evidence.vertical,
                 "media_path": evidence.media_path,
                 "validation_error": evidence.error,
+                "validation_status": (
+                    "media-verified"
+                    if evidence.valid_short
+                    else "rejected during media validation"
+                ),
+                "media_verification": (
+                    "verified" if evidence.valid_short else "rejected"
+                ),
+                "validation_evidence": (
+                    "Local media contains video and audio, is vertical, and "
+                    "has a 5–180 second duration."
+                    if evidence.valid_short
+                    else (
+                        "Local media validation rejected the candidate: "
+                        f"{evidence.error or 'required media evidence was absent'}."
+                    )
+                ),
             }
             if evidence.valid_short:
                 verified.append(enriched)
-        selected = select_diverse(
-            verified, count=target_count, max_per_creator=max_per_creator,
+            else:
+                exclusion = _exclusion(
+                    enriched,
+                    "media-validation",
+                    "Rejected during media validation.",
+                    evidence=enriched["validation_evidence"],
+                )
+                exclusion["validation_status"] = (
+                    "rejected during media validation"
+                )
+                media_exclusions.append(exclusion)
+        selected = select_benchmark_cohorts(
+            verified,
+            established_count=established,
+            breakout_count=breakout,
+            max_per_creator=max_per_creator,
             max_per_topic=max_per_topic,
         )
         if retain_media == "selected":
-            selected_ids = {item["video_id"] for item in selected}
+            selected_ids = {item["video_id"] for item in selected.selected}
             for item in verified:
                 if item["video_id"] not in selected_ids and item.get("media_path"):
                     Path(item["media_path"]).unlink(missing_ok=True)
-        self.queue.upsert_discovered(selected)
+        self.queue.upsert_discovered(selected.selected)
         return {
-            "dry_run": False, "pool_count": len(hydrated),
-            "verified_count": len(verified), "selected_count": len(selected),
-            "selected": selected,
+            "dry_run": False,
+            "pool_count": len(hydrated),
+            "metadata_qualified_count": len(qualified),
+            "verified_count": len(verified),
+            "selected_count": len(selected.selected),
+            "cohorts": {
+                "established": sum(
+                    item["cohort"] == "established"
+                    for item in selected.selected
+                ),
+                "breakout": sum(
+                    item["cohort"] == "breakout"
+                    for item in selected.selected
+                ),
+            },
+            "validation_summary": {
+                "metadata_qualified": len(qualified),
+                "media_verified": len(verified),
+                "rejected_during_media_validation": len(media_exclusions),
+                "media_verification": "complete",
+            },
+            "selected": selected.selected,
+            "exclusions": (
+                metadata_exclusions
+                + shortlist_exclusions
+                + media_exclusions
+                + selected.excluded
+            ),
         }
 
     def refresh_stats(self) -> int:
@@ -690,18 +1469,31 @@ class ReferenceDiscoveryService:
             if not stats:
                 continue
             updated = {**candidate, **stats}
-            updated["score"], updated["ranking"] = score_candidate(updated)
+            updated["gaming_relevance"] = evaluate_gaming_relevance(updated)
+            updated["source_quality"] = evaluate_source_quality(updated)
+            if not candidate.get("topic_manually_corrected"):
+                updated["topic"] = (
+                    updated["gaming_relevance"].get("topic")
+                    or "unknown-gaming"
+                )
+            updated["score"], updated["ranking"] = score_candidate(
+                updated,
+                cohort=updated.get("cohort") or "established",
+            )
             refreshed.append(updated)
         self.queue.refresh_metadata(refreshed)
         return len(refreshed)
 
     def accept(
         self, video_id: str, *, category: str, notes: str,
-        transcription: bool = False,
+        transcription: bool = False, topic: str | None = None,
     ) -> dict[str, Any]:
         candidate = self.queue.get(video_id)
         if candidate["status"] != "discovered":
             raise ReferenceDiscoveryError("Only discovered candidates can be accepted.")
+        if topic is not None:
+            candidate["topic"] = topic
+            candidate["topic_manually_corrected"] = True
         media_path = candidate.get("media_path")
         if not isinstance(media_path, str) or not Path(media_path).is_file():
             evidence = self.media_validator.validate(candidate, retain=True)
@@ -775,6 +1567,7 @@ class ReferenceDiscoveryService:
             raise
         self.queue.decide(
             video_id, "accepted", notes=notes, category=category,
+            topic=topic,
             accepted_reference_id=reference_id,
         )
         return entry
@@ -808,7 +1601,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     discover = sub.add_parser("discover")
     discover.add_argument("--dry-run", action="store_true")
-    discover.add_argument("--target-count", type=int, default=20)
+    discover.add_argument(
+        "--target-count",
+        type=int,
+        help="Balanced total split between established and breakout cohorts.",
+    )
+    discover.add_argument("--established-count", type=int)
+    discover.add_argument("--breakout-count", type=int)
     discover.add_argument("--pool-size", type=int, default=100)
     discover.add_argument("--publication-days", type=int, default=365)
     discover.add_argument("--region", default="US")
@@ -832,15 +1631,27 @@ def main(argv: Sequence[str] | None = ()) -> int:
     try:
         if args.command == "discover":
             for value, label in (
-                (args.target_count, "target count"), (args.pool_size, "pool size"),
+                (args.pool_size, "pool size"),
                 (args.publication_days, "publication days"),
                 (args.max_per_creator, "creator cap"),
                 (args.max_per_topic, "topic cap"),
             ):
                 if value < 1:
                     raise ReferenceDiscoveryError(f"{label} must be positive.")
+            if args.target_count is not None and args.target_count < 1:
+                raise ReferenceDiscoveryError("target count must be positive.")
+            for value, label in (
+                (args.established_count, "established count"),
+                (args.breakout_count, "breakout count"),
+            ):
+                if value is not None and value < 0:
+                    raise ReferenceDiscoveryError(
+                        f"{label} must be nonnegative."
+                    )
             result = service.discover(
                 target_count=args.target_count, pool_size=args.pool_size,
+                established_count=args.established_count,
+                breakout_count=args.breakout_count,
                 publication_days=args.publication_days, region=args.region,
                 max_per_creator=args.max_per_creator,
                 max_per_topic=args.max_per_topic,
@@ -866,7 +1677,7 @@ def main(argv: Sequence[str] | None = ()) -> int:
                     f"Queue is valid, but {missing_media} retained media file(s) are missing."
                 )
             print(f"Reference candidate queue is valid: {len(items)} item(s).")
-    except ReferenceDiscoveryError as error:
+    except (ReferenceDiscoveryError, ValueError) as error:
         print(f"Reference discovery failed: {error}", file=sys.stderr)
         return 1
     return 0

@@ -237,10 +237,13 @@ class FakeReferenceDiscovery:
         self.queue = queue
         self.accepted = []
 
-    def accept(self, video_id, *, category, notes, transcription):
-        self.accepted.append((video_id, category, notes, transcription))
+    def accept(self, video_id, *, category, notes, transcription, topic=None):
+        self.accepted.append(
+            (video_id, category, notes, transcription, topic)
+        )
         self.queue.decide(
             video_id, "accepted", notes=notes, category=category,
+            topic=topic,
             accepted_reference_id=f"youtube-{video_id}",
         )
 
@@ -258,6 +261,10 @@ def reference_candidate(tmp_path):
         "height": 1920, "frame_rate": 60, "has_video": True,
         "has_audio": True, "source_url": "https://www.youtube.com/watch?v=short_one",
         "discovery_query": "gaming shorts", "topic": "gaming",
+        "cohort": "established", "validation_status": "media-verified",
+        "media_verification": "verified",
+        "gaming_relevance": {"evidence": "YouTube category 20 (Gaming)."},
+        "source_quality": {"evidence": "No derivative markers."},
         "score": 80, "rank": 1,
         "ranking": {"evidence": "Transparent ranking evidence."},
         "media_path": str(media),
@@ -279,15 +286,19 @@ def test_reference_candidate_page_token_media_and_decisions(tmp_path):
             server, "/reference-candidates/short_one/decision",
             {
                 "form_token": "test-token", "action": "reject",
-                "category": "gaming_highlight", "note": "repost",
+                "category": "gaming_highlight", "topic": "manual-game",
+                "note": "repost",
             },
         )
+        assert queue.get("short_one")["status"] == "rejected"
+        assert queue.get("short_one")["topic"] == "manual-game"
         queue.decide("short_one", "discovered")
         accepted, _, _ = post(
             server, "/reference-candidates/short_one/decision",
             {
                 "form_token": "test-token", "action": "accept",
-                "category": "personality_reaction", "note": "complete beat",
+                "category": "personality_reaction", "topic": "roblox",
+                "note": "complete beat",
             },
         )
     text = body.decode()
@@ -295,13 +306,16 @@ def test_reference_candidate_page_token_media_and_decisions(tmp_path):
     assert "Gaming &amp; reaction" in text
     assert 'name="form_token" value="test-token"' in text
     assert "Transparent ranking evidence" in text
+    assert "media-verified" in text
+    assert 'name="topic" value="gaming"' in text
     assert media_status == 200 and media_body == b"reference-media"
     assert rejected == 303 and "reference-candidates" in headers["Location"]
     assert accepted == 303
     assert service.accepted == [
-        ("short_one", "personality_reaction", "complete beat", False)
+        ("short_one", "personality_reaction", "complete beat", False, "roblox")
     ]
     assert queue.get("short_one")["status"] == "accepted"
+    assert queue.get("short_one")["topic"] == "roblox"
 
 
 def test_reference_candidate_form_rejects_bad_token(tmp_path):
@@ -314,6 +328,23 @@ def test_reference_candidate_form_rejects_bad_token(tmp_path):
             {"form_token": "wrong", "action": "reject"},
         )
     assert status == 403
+    assert queue.get("short_one")["status"] == "discovered"
+
+
+def test_reference_candidate_form_rejects_invalid_manual_topic(tmp_path):
+    with running_server(tmp_path) as (server, _, _):
+        queue = ReferenceCandidateQueue(tmp_path / "reference-candidates.json")
+        queue.upsert_discovered([reference_candidate(tmp_path)])
+        server.app.reference_candidate_queue = queue
+        status, _, _ = post(
+            server, "/reference-candidates/short_one/decision",
+            {
+                "form_token": "test-token",
+                "action": "reject",
+                "topic": "../not-a-topic",
+            },
+        )
+    assert status == 400
     assert queue.get("short_one")["status"] == "discovered"
 
 

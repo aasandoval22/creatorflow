@@ -402,6 +402,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             action = self._one(form, "action", required=True)
             note = self._one(form, "note") or ""
             category = self._one(form, "category") or "gaming_highlight"
+            topic = self._one(form, "topic")
             if len(note) > MAX_NOTE:
                 raise RequestError(
                     HTTPStatus.BAD_REQUEST,
@@ -409,6 +410,14 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 )
             if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", category):
                 raise RequestError(HTTPStatus.BAD_REQUEST, "Invalid reference category.")
+            if topic is not None and not re.fullmatch(
+                r"[a-z0-9][a-z0-9_-]{0,63}",
+                topic,
+            ):
+                raise RequestError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Invalid reference topic.",
+                )
             if action == "accept":
                 if service is None:
                     raise ReferenceDiscoveryError(
@@ -416,12 +425,15 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                     )
                 service.accept(
                     video_id, category=category, notes=note,
-                    transcription=False,
+                    transcription=False, topic=topic,
                 )
                 message = f"{video_id} was accepted and registered as a reference."
             elif action in {"reject", "duplicate", "discovered"}:
                 queue.decide(
-                    video_id, action, notes=note, category=category
+                    video_id,
+                    "rejected" if action == "reject" else action,
+                    notes=note, category=category,
+                    topic=topic,
                 )
                 message = f"{video_id} is now {action}."
             else:
@@ -733,6 +745,8 @@ def render_reference_candidates(
         )
         ranking = item.get("ranking") or {}
         evidence = ranking.get("evidence") or "Ranking evidence unavailable."
+        relevance = item.get("gaming_relevance") or {}
+        source_quality = item.get("source_quality") or {}
         cards.append(
             f"""<article class="card"><div>{media}</div><div>
 <h2>Rank {_e(item.get('rank'))}: {_e(item.get('title'))}</h2>
@@ -744,8 +758,13 @@ def render_reference_candidates(
 <strong>Likes:</strong> {_e(item.get('like_count'))} ·
 <strong>Comments:</strong> {_e(item.get('comment_count'))}<br>
 <strong>Topic:</strong> {_e(item.get('topic'))} ·
+<strong>Cohort:</strong> {_e(item.get('cohort'))}<br>
 <strong>Query:</strong> {_e(item.get('discovery_query'))}<br>
-<strong>Score:</strong> {_e(item.get('score'))}</p>
+<strong>Score:</strong> {_e(item.get('score'))}<br>
+<strong>Validation:</strong> {_e(item.get('validation_status'))} ·
+media evidence={_e(item.get('media_verification'))}</p>
+<p><strong>Gaming relevance:</strong> {_e(relevance.get('evidence') or 'Unavailable')}</p>
+<p><strong>Source quality:</strong> {_e(source_quality.get('evidence') or 'Unavailable')}</p>
 <p><strong>Why it ranked:</strong> {_e(evidence)}</p>
 <p><strong>Media:</strong> {_e(item.get('verified_duration'))}s,
 {_e(item.get('width'))}×{_e(item.get('height'))},
@@ -756,6 +775,8 @@ audio={_e(item.get('has_audio'))}</p>
 <form method="post" action="/reference-candidates/{video_id}/decision">
 {hidden}<label>Reference category
 <input name="category" value="{_e(item.get('category') or 'gaming_highlight')}"></label>
+<label>Game/topic
+<input name="topic" value="{_e(item.get('topic') or 'unknown-gaming')}"></label>
 <label>Notes<textarea name="note" maxlength="{MAX_NOTE}">{_e(item.get('notes') or '')}</textarea></label>
 <button name="action" value="accept">Accept as reference</button>
 <button name="action" value="reject">Reject</button>
