@@ -119,6 +119,14 @@ class PreviewResult:
     metadata_path: str | None = None
     command: tuple[str, ...] = ()
     rendered: bool = False
+    candidate_start: float | None = None
+    candidate_end: float | None = None
+    lead_in_seconds: float | None = None
+    tail_seconds: float | None = None
+    context_profile: str | None = None
+    expansion_reasons: tuple[str, ...] = ()
+    start_boundary_method: str | None = None
+    end_boundary_method: str | None = None
 
 
 class PreviewError(ValueError):
@@ -191,6 +199,11 @@ class VideoPreviewRenderer:
         render_end: float | None = None,
         clamp: bool = False,
         timing_revision: int = 0,
+        timing_source: str = "candidate",
+        context_profile: str | None = None,
+        context_reasons: Sequence[str] = (),
+        start_boundary_method: str | None = None,
+        end_boundary_method: str | None = None,
     ) -> PreviewResult:
         try:
             if (
@@ -203,13 +216,25 @@ class VideoPreviewRenderer:
                 candidates_path=candidates_path,
                 render_start=render_start, render_end=render_end, clamp=clamp,
             )
+            if timing_source not in {"candidate", "automatic", "manual"}:
+                raise PreviewError("Timing source must be candidate, automatic, or manual.")
+            context.update(
+                timing_source=timing_source, context_profile=context_profile,
+                context_reasons=list(context_reasons),
+                start_boundary_method=start_boundary_method,
+                end_boundary_method=end_boundary_method,
+            )
             candidate = context["candidate"]
             window = context["render"]
             final_video, metadata_path = self._output_paths(
                 video_id, candidate["candidate_id"],
                 output_path or self.output_directory,
             )
-            if not force and self._valid_existing(final_video, metadata_path):
+            if not force and self._valid_existing(
+                final_video, metadata_path, render_start=window["start"],
+                render_end=window["end"], timing_source=timing_source,
+                context_profile=context_profile,
+            ):
                 return self._result(
                     PreviewResultStatus.SKIPPED,
                     "A valid preview already exists; use --force to replace it.",
@@ -644,7 +669,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         configuration = asdict(self.configuration)
         configuration.pop("pixel_format")
         metadata = {
-            "version": 2, "video_id": context["record"]["video_id"],
+            "version": 3, "video_id": context["record"]["video_id"],
             "candidate_id": candidate["candidate_id"],
             "candidate_rank": candidate["rank"],
             "source_media_path": str(context["media_path"]),
@@ -659,6 +684,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             "lead_in_seconds": round(candidate["start"] - render["start"], 3),
             "tail_seconds": round(render["end"] - candidate["end"], 3),
             "timing_revision": timing_revision,
+            "timing_source": context.get("timing_source", "candidate"),
+            "context_profile": context.get("context_profile"),
+            "context_reasons": context.get("context_reasons", []),
+            "start_boundary_method": context.get("start_boundary_method"),
+            "end_boundary_method": context.get("end_boundary_method"),
             "output_path": str(final_video.resolve()), "created_at": utc_now(),
             "render_configuration": configuration,
             "caption_configuration": {
@@ -756,15 +786,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             return final, final.with_name("preview.json")
         return final / video_id / candidate_id / "preview.mp4", final / video_id / candidate_id / "preview.json"
 
-    def _valid_existing(self, video: Path, metadata: Path) -> bool:
+    def _valid_existing(
+        self, video: Path, metadata: Path, *, render_start: float | None = None,
+        render_end: float | None = None, timing_source: str | None = None,
+        context_profile: str | None = None,
+    ) -> bool:
         if not video.is_file() or not metadata.is_file():
             return False
         try:
             document = self._read_json(metadata, "preview metadata")
-            return (
-                document.get("version") in (1, 2)
+            valid = (
+                document.get("version") in (1, 2, 3)
                 and Path(document.get("output_path", "")).resolve() == video.resolve()
             )
+            if render_start is not None:
+                stored_start = document.get("render_start", document.get("candidate_start"))
+                stored_end = document.get("render_end", document.get("candidate_end"))
+                valid = valid and isinstance(stored_start, (int, float)) and isinstance(
+                    stored_end, (int, float)
+                ) and abs(float(stored_start) - render_start) <= 0.001 and abs(
+                    float(stored_end) - (render_end or 0.0)
+                ) <= 0.001
+            if timing_source == "automatic":
+                valid = valid and document.get("timing_source") == "automatic"
+                valid = valid and document.get("context_profile") == context_profile
+            return valid
         except (PreviewError, OSError):
             return False
 
@@ -779,4 +825,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             candidate["candidate_id"], candidate["rank"], render["start"],
             render["end"], render["duration"], str(video), str(metadata),
             tuple(command), rendered,
+            candidate["start"], candidate["end"],
+            candidate["start"] - render["start"], render["end"] - candidate["end"],
+            context.get("context_profile"), tuple(context.get("context_reasons", ())),
+            context.get("start_boundary_method"), context.get("end_boundary_method"),
         )

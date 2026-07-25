@@ -175,7 +175,30 @@ Render the top three ranked candidates, a larger top set, or explicit ranks:
 python -m backend.app.render_previews --video-id VIDEO_ID
 python -m backend.app.render_previews --video-id VIDEO_ID --top 4
 python -m backend.app.render_previews --video-id VIDEO_ID --ranks 1,3
+python -m backend.app.render_previews --video-id VIDEO_ID --context-profile compact
+python -m backend.app.render_previews --video-id VIDEO_ID --context-profile none
+python -m backend.app.render_previews --video-id VIDEO_ID --force --reapply-context
 ```
+
+Batch rendering treats each analyzed candidate as an immutable anchor, not the
+complete final clip. The default `reaction` profile starts with 15 seconds of
+lead-in and 12 seconds of tail, normally produces 50–90 second previews, and
+aims for 60 seconds. It is intended for gameplay reactions, rank guesses, clip
+reviews, funny stream moments, and other setup/payoff sequences. The `compact`
+profile starts with 6 seconds on each side, normally produces 35–60 second
+previews, and aims for 45 seconds. Explicit `--lead-in`, `--tail`,
+`--minimum-final-duration`, `--target-final-duration`, and
+`--maximum-final-duration` values override profile defaults. Use
+`--context-profile none` for candidate-only batch timing.
+
+Boundaries are approximated deterministically from source timing, transcript
+sentences, pauses, questions, answers, result language, and reactions. This
+does not visually understand the gameplay or video. Human review remains
+required. Automatic context never changes candidate timestamps, text, score,
+rank, or ID; preview metadata stores candidate and render ranges separately.
+Manual timing continues to win during ordinary batch rerenders. An intentional
+`--reapply-context` recalculates automatic timing and, after a verified
+replacement, returns a changed review to pending while preserving its note.
 
 Successful previews and valid existing previews are recorded in the versioned
 local queue at `data/review_queue/reviews.json`. The queue preserves human
@@ -206,7 +229,9 @@ python -m backend.app.review_server
 
 Open `http://127.0.0.1:8080/`. Each card can approve or reject a clip with a
 note, return it to pending, rerender relative or absolute timing, or reset the
-preview to its immutable candidate timing. Rerendering is synchronous and may
+preview to its immutable candidate timing. It also displays the context
+profile, timing source, lead-in, tail, and expansion reasons, and offers a
+token-protected **Reapply Automatic Context** action. Rerendering is synchronous and may
 take some time; a successful replacement returns the clip to pending review.
 These controls reuse the same queue and timing-adjustment services as the CLI.
 The CLI and static index remain available.
@@ -263,3 +288,4 @@ replacement increments the timing revision and returns the item to `pending`
 for another human review. Existing notes are preserved unless `--note` replaces
 one or `--clear-note` clears it. Preview replacement is local and atomic: a
 failed render or probe leaves the prior valid preview and queue state intact.
+None of the automatic-context controls uploads or publishes content.

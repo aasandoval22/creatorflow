@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Sequence
 
 from backend.services.clip_review_queue import ClipReviewQueue
+from backend.services.clip_context_expander import (
+    ClipContextExpander, ContextExpansionConfiguration,
+)
 from backend.services.video_preview_renderer import (
     PreviewResultStatus,
     VideoPreviewRenderer,
@@ -24,6 +27,17 @@ class BatchCandidateResult:
     preview_path: str | None = None
     metadata_path: str | None = None
     review_id: str | None = None
+    candidate_start: float | None = None
+    candidate_end: float | None = None
+    render_start: float | None = None
+    render_end: float | None = None
+    render_duration: float | None = None
+    lead_in_seconds: float | None = None
+    tail_seconds: float | None = None
+    start_boundary_method: str | None = None
+    end_boundary_method: str | None = None
+    expansion_reasons: tuple[str, ...] = ()
+    timing_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +69,8 @@ class BatchPreviewRenderer:
         self, video_id: str, *, top: int = 3, ranks: Sequence[int] | None = None,
         candidates_path: Path | None = None, force: bool = False,
         dry_run: bool = False, maximum_preview_count: int | None = None,
+        context_configuration: ContextExpansionConfiguration | None = None,
+        reapply_context: bool = False,
     ) -> BatchPreviewResult:
         if isinstance(top, bool) or not isinstance(top, int) or top < 1:
             raise ValueError("Top must be a positive integer.")
@@ -122,16 +138,63 @@ class BatchPreviewRenderer:
                     self.review_queue.find_by_candidate(video_id, candidate["candidate_id"])
                     if hasattr(self.review_queue, "find_by_candidate") else None
                 )
-                timing = {}
-                if existing is not None:
+                expansion = None
+                timing_source = "candidate"
+                profile = None
+                reasons: tuple[str, ...] = ()
+                methods = (None, None)
+                if existing is not None and (
+                    existing.get("timing_source") == "manual"
+                    or "timing_source" not in existing and existing.get("timing_revision", 0) > 0
+                ) and not reapply_context:
                     timing = {
                         "render_start": existing["render_start"],
                         "render_end": existing["render_end"],
                         "timing_revision": existing["timing_revision"],
                     }
+                    timing_source = "manual"
+                    profile = existing.get("context_profile")
+                    reasons = tuple(existing.get("context_reasons", ()))
+                elif context_configuration is not None:
+                    prepared = self.renderer.prepare(
+                        video_id, rank=rank, candidates_path=artifact_path
+                    )
+                    expansion = ClipContextExpander().expand(
+                        candidate["start"], candidate["end"],
+                        prepared["source_probe"].duration, prepared["transcript"],
+                        context_configuration,
+                    )
+                    timing = {
+                        "render_start": expansion.render_start,
+                        "render_end": expansion.render_end,
+                        "timing_revision": (
+                            existing["timing_revision"] + 1 if existing and (
+                                existing["render_start"] != expansion.render_start
+                                or existing["render_end"] != expansion.render_end
+                            ) else existing["timing_revision"] if existing else 0
+                        ),
+                    }
+                    timing_source = "automatic"
+                    profile = context_configuration.profile
+                    reasons = expansion.expansion_reasons
+                    methods = (
+                        expansion.start_boundary_method, expansion.end_boundary_method
+                    )
+                else:
+                    timing = {}
+                    if existing is not None:
+                        timing = {
+                            "render_start": existing["render_start"],
+                            "render_end": existing["render_end"],
+                            "timing_revision": existing["timing_revision"],
+                        }
+                        timing_source = existing.get("timing_source", "candidate")
                 rendered = self.renderer.render(
                     video_id, rank=rank, candidates_path=artifact_path,
                     force=force, dry_run=dry_run, **timing,
+                    timing_source=timing_source, context_profile=profile,
+                    context_reasons=reasons,
+                    start_boundary_method=methods[0], end_boundary_method=methods[1],
                 )
             except (OSError, ValueError) as error:
                 results.append(BatchCandidateResult(
@@ -144,10 +207,34 @@ class BatchPreviewRenderer:
             if rendered.status in (PreviewResultStatus.SUCCESS, PreviewResultStatus.SKIPPED) and not dry_run:
                 try:
                     self._verify_preview(rendered.output_path, rendered.metadata_path, video_id, candidate["candidate_id"])
-                    review = self.review_queue.add_or_update_preview(
-                        video_id, candidate, rendered.output_path, rendered.metadata_path
-                    )
+                    changed = bool(existing and (
+                        existing["render_start"] != rendered.start
+                        or existing["render_end"] != rendered.end
+                    ))
+                    if changed and timing_source == "automatic":
+                        review = self.review_queue.update_timing(
+                            existing["review_id"], render_start=rendered.start,
+                            render_end=rendered.end, preview_path=rendered.output_path,
+                            preview_metadata_path=rendered.metadata_path,
+                            timing_source="automatic", context_profile=profile,
+                            context_reasons=reasons,
+                        )
+                    else:
+                        if context_configuration is None:
+                            review = self.review_queue.add_or_update_preview(
+                                video_id, candidate, rendered.output_path, rendered.metadata_path
+                            )
+                        else:
+                            review = self.review_queue.add_or_update_preview(
+                                video_id, candidate, rendered.output_path, rendered.metadata_path,
+                                render_start=rendered.start, render_end=rendered.end,
+                                timing_source=timing_source, context_profile=profile,
+                                context_reasons=reasons,
+                            )
                     review_id = review["review_id"]
+                    timing_revision = review.get(
+                        "timing_revision", existing.get("timing_revision", 0) if existing else 0
+                    )
                 except (OSError, ValueError, json.JSONDecodeError) as error:
                     rendered_status = "failed"
                     message = f"Preview verification failed: {error}"
@@ -158,6 +245,13 @@ class BatchPreviewRenderer:
             results.append(BatchCandidateResult(
                 rank, candidate["candidate_id"], rendered_status, message,
                 rendered.output_path, rendered.metadata_path, review_id,
+                candidate["start"], candidate["end"], rendered.start, rendered.end,
+                rendered.duration, rendered.lead_in_seconds, rendered.tail_seconds,
+                rendered.start_boundary_method, rendered.end_boundary_method,
+                rendered.expansion_reasons,
+                timing_revision if review_id else (
+                    existing["timing_revision"] if existing else 0
+                ),
             ))
         return BatchPreviewResult(video_id, tuple(results))
 
@@ -172,7 +266,7 @@ class BatchPreviewRenderer:
             raise ValueError("Preview metadata path does not exist.")
         with Path(metadata_path).open(encoding="utf-8") as stream:
             metadata = json.load(stream)
-        if not isinstance(metadata, dict) or metadata.get("version") not in (1, 2):
+        if not isinstance(metadata, dict) or metadata.get("version") not in (1, 2, 3):
             raise ValueError("Preview metadata version is invalid.")
         if metadata.get("video_id") != video_id or metadata.get("candidate_id") != candidate_id:
             raise ValueError("Preview metadata identity does not match the candidate.")

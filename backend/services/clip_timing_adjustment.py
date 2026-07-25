@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from backend.services.clip_review_queue import ClipReviewQueue, ReviewQueueError
+from backend.services.clip_context_expander import (
+    ClipContextExpander, ContextExpansionConfiguration,
+)
 from backend.services.video_preview_renderer import PreviewResult, PreviewResultStatus, VideoPreviewRenderer
 
 
@@ -44,6 +47,10 @@ class ClipTimingAdjustmentService:
         render_end: float | None = None, allow_longer: bool = False,
         note: str | None = None, clear_note: bool = False,
         dry_run: bool = False, force: bool = True,
+        timing_source: str = "manual", context_profile: str | None = None,
+        context_reasons: tuple[str, ...] | list[str] = (),
+        start_boundary_method: str | None = None,
+        end_boundary_method: str | None = None,
     ) -> TimingAdjustmentResult:
         with self.queue.locked():
             return self._adjust_locked(
@@ -51,6 +58,10 @@ class ClipTimingAdjustmentService:
                 render_start=render_start, render_end=render_end,
                 allow_longer=allow_longer, note=note, clear_note=clear_note,
                 dry_run=dry_run, force=force,
+                timing_source=timing_source, context_profile=context_profile,
+                context_reasons=context_reasons,
+                start_boundary_method=start_boundary_method,
+                end_boundary_method=end_boundary_method,
             )
 
     def _adjust_locked(
@@ -59,6 +70,10 @@ class ClipTimingAdjustmentService:
         render_end: float | None = None, allow_longer: bool = False,
         note: str | None = None, clear_note: bool = False,
         dry_run: bool = False, force: bool = True,
+        timing_source: str = "manual", context_profile: str | None = None,
+        context_reasons: tuple[str, ...] | list[str] = (),
+        start_boundary_method: str | None = None,
+        end_boundary_method: str | None = None,
     ) -> TimingAdjustmentResult:
         item = self.queue.find_by_review_id(review_id)
         if item is None:
@@ -109,6 +124,10 @@ class ClipTimingAdjustmentService:
                 dry_run=dry_run, output_path=old_video,
                 render_start=proposed_start, render_end=proposed_end,
                 timing_revision=item["timing_revision"] + 1,
+                timing_source=timing_source, context_profile=context_profile,
+                context_reasons=context_reasons,
+                start_boundary_method=start_boundary_method,
+                end_boundary_method=end_boundary_method,
             )
             if preview.status is PreviewResultStatus.FAILED:
                 raise ReviewQueueError(preview.message)
@@ -119,6 +138,8 @@ class ClipTimingAdjustmentService:
                 preview_path=preview.output_path or old_video,
                 preview_metadata_path=preview.metadata_path or old_metadata,
                 note=note, clear_note=clear_note,
+                timing_source=timing_source, context_profile=context_profile,
+                context_reasons=context_reasons,
             )
         except Exception:
             for original, backup in backups:
@@ -135,7 +156,34 @@ class ClipTimingAdjustmentService:
             raise ReviewQueueError(f"Review ID {review_id!r} was not found.")
         return self.adjust(
             review_id, render_start=item["candidate_start"],
-            render_end=item["candidate_end"], **kwargs,
+            render_end=item["candidate_end"], timing_source="candidate", **kwargs,
+        )
+
+    def reapply_context(
+        self, review_id: str, *, profile: str = "reaction",
+        configuration: ContextExpansionConfiguration | None = None,
+        **kwargs: Any,
+    ) -> TimingAdjustmentResult:
+        item = self.queue.find_by_review_id(review_id)
+        if item is None:
+            raise ReviewQueueError(f"Review ID {review_id!r} was not found.")
+        prepared = self.renderer.prepare(
+            item["video_id"], candidate_id=item["candidate_id"]
+        )
+        config = configuration or ContextExpansionConfiguration.for_profile(profile)
+        expanded = ClipContextExpander().expand(
+            item["candidate_start"], item["candidate_end"],
+            prepared["source_probe"].duration, prepared["transcript"], config,
+        )
+        return self.adjust(
+            review_id, render_start=expanded.render_start,
+            render_end=expanded.render_end,
+            allow_longer=config.allow_longer or expanded.render_duration > self.maximum_duration,
+            timing_source="automatic", context_profile=config.profile,
+            context_reasons=expanded.expansion_reasons,
+            start_boundary_method=expanded.start_boundary_method,
+            end_boundary_method=expanded.end_boundary_method,
+            **kwargs,
         )
 
     @staticmethod

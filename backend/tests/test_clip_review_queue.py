@@ -32,7 +32,7 @@ def test_creates_queue_and_stable_identity(tmp_path):
 
 
 @pytest.mark.parametrize("change", [
-    lambda d: d.update(version=3),
+    lambda d: d.update(version=4),
     lambda d: d["items"][0].update(status="maybe"),
     lambda d: d["items"][0].update(created_at="yesterday"),
     lambda d: d["items"][0].update(candidate_score=101),
@@ -123,7 +123,7 @@ def test_version_one_migrates_atomically_and_preserves_review(tmp_path):
     path.write_text(json.dumps(document))
 
     migrated = ClipReviewQueue(path).find_by_review_id(reviewed["review_id"])
-    assert json.loads(path.read_text())["version"] == 2
+    assert json.loads(path.read_text())["version"] == 3
     assert migrated["status"] == "approved"
     assert migrated["review_note"] == "keep this"
     assert migrated["render_start"] == migrated["candidate_start"]

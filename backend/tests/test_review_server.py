@@ -166,7 +166,7 @@ def test_index_metadata_escaping_forms_and_no_external_resources(tmp_path):
     for label in ("Original candidate", "Current render", "Timing revision",
                   "Preview metadata path", "Review note", "Lead-in", "Tail"):
         assert label in text
-    assert text.count('name="form_token" value="test-token"') == 3
+        assert text.count('name="form_token" value="test-token"') == 4
     assert "autoplay" not in text and "https://" not in text and "<script" not in text
     assert f"/media/{item['review_id']}" in text
 

@@ -70,7 +70,7 @@ def test_paths_ranks_dry_run_and_renderer_configuration(monkeypatch):
     assert not renderer.kwargs["configuration"].captions_enabled
     assert renderer.kwargs["caption_configuration"].maximum_words == 4
     assert renderer.kwargs["ffmpeg_path"] == "/ffmpeg"
-    assert str(FakeQueue.instances[-1].path) == "/q.json"
+    assert not FakeQueue.instances  # Dry runs must not create or migrate queue state.
     kwargs = FakeBatch.instances[-1].calls[0][1]
     assert kwargs["ranks"] == [3, 1] and kwargs["dry_run"] and kwargs["force"]
     assert str(kwargs["candidates_path"]) == "/c.json"
