@@ -22,6 +22,29 @@
   configuration without explicit approval.
 - Never deploy or publish content without explicit approval.
 
+## Pull request workflow
+
+- Create every completed development milestone on a feature branch based on
+  the latest `origin/main`.
+- Before creating a pull request, run the complete required test suite and
+  `git diff --check`.
+- Push the tested feature branch to `origin`.
+- Check whether a pull request already exists for the feature branch before
+  creating one. Never create duplicate pull requests.
+- If no pull request exists, create one targeting `main` with a concise
+  implementation summary, validation results, and known limitations.
+- Never merge a pull request as part of initial implementation unless the user
+  explicitly requests the merge.
+- Before merging, inspect required checks, mergeability, conflicts, and review
+  status.
+- Never bypass required checks, use administrator overrides, or force-push.
+- Use the repository's normal squash-merge method unless explicitly instructed
+  otherwise.
+- After a successful merge, update the local `main` branch, rerun the required
+  test suite, and delete the merged feature branch when safe.
+- Always report the pull request number or URL, commit hash, checks, merge
+  result, final test results, and final Git status.
+
 ## Definition of done
 
 - The requested behavior is implemented.
