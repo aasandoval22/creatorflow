@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -132,6 +133,43 @@ def test_refuses_local_main_that_is_not_exact_origin_main(tmp_path):
         deployer.deploy()
 
 
+def test_symlinked_virtual_environment_launcher_path_is_preserved(tmp_path):
+    deployer, _ = make_deployer(tmp_path)
+    launcher = deployer.development_root / ".venv" / "bin" / "python"
+    assert launcher.is_symlink()
+    assert launcher.resolve() != launcher
+    assert deployer.python_executable == launcher
+    deployer._ensure_development_launcher()
+
+
+def test_regular_executable_launcher_path_is_preserved(tmp_path):
+    deployer, _ = make_deployer(tmp_path)
+    launcher = deployer.development_root / ".venv" / "bin" / "python"
+    launcher.unlink()
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    assert deployer.python_executable == launcher
+    deployer._ensure_development_launcher()
+
+
+@pytest.mark.parametrize("present", [False, True])
+def test_missing_or_non_executable_launcher_fails_before_data_migration(
+    tmp_path, present,
+):
+    deployer, _ = make_deployer(tmp_path)
+    launcher = deployer.development_root / ".venv" / "bin" / "python"
+    launcher.unlink()
+    if present:
+        launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+        launcher.chmod(0o600)
+    with pytest.raises(
+        DeploymentError, match="not executable" if present else "is missing"
+    ):
+        deployer.deploy()
+    assert (deployer.development_root / "data").is_dir()
+    assert not deployer.data_root.exists()
+
+
 def test_deploy_isolated_exact_commit_and_migrates_persistent_data(tmp_path):
     deployer, processes = make_deployer(tmp_path)
     original_data = deployer.development_root / "data"
@@ -179,6 +217,23 @@ def test_repeat_deployment_same_commit_is_idempotent(tmp_path):
     assert second["created_release"] is False
     assert second["deployed_commit"] == COMMIT
     assert second["previous_commit"] == COMMIT
+    assert deployer.current_link.resolve() == Path(first["release_path"])
+    assert deployer.data_root.stat().st_ino == (
+        deployer.development_root / "data"
+    ).stat().st_ino
+
+
+def test_service_manager_preserves_stable_current_symlink_path(tmp_path):
+    release = tmp_path / "production" / "releases" / COMMIT
+    release.mkdir(parents=True)
+    current = tmp_path / "production" / "current"
+    current.symlink_to(release)
+    service = autoclip_service.AutoClipServiceManager(
+        project_root=current,
+        template_directory=autoclip_service.TEMPLATE_DIRECTORY,
+    )
+    assert service.project_root == current
+    assert service.python_path == current / ".venv" / "bin" / "python"
 
 
 class PreparationProcesses(FakeProcesses):
@@ -232,7 +287,12 @@ def test_release_preparation_mocks_dependencies_and_validates_exact_commit(tmp_p
     commands = [command for command, _ in processes.commands]
     assert any(command[:3] == ("git", "worktree", "add") for command in commands)
     assert any(command[1:4] == ("-m", "pip", "install") for command in commands)
-    assert any(command[1:3] == ("-m", "pytest") for command in commands)
+    test_command = next(
+        command for command in commands if command[1:3] == ("-m", "pytest")
+    )
+    assert test_command[0] == str(
+        deployer.development_root / ".venv" / "bin" / "python"
+    )
 
 
 def test_dependency_failure_removes_incomplete_release(tmp_path):
@@ -241,9 +301,16 @@ def test_dependency_failure_removes_incomplete_release(tmp_path):
         tmp_path, processes, cls=ProductionDeployer
     )
     deployer._prepare_persistent_data()
+    marker = deployer.data_root / "preserved.txt"
+    marker.write_text("persistent", encoding="utf-8")
     with pytest.raises(DeploymentError, match="dependency installation"):
         deployer._prepare_release(COMMIT)
     assert not (deployer.releases_root / COMMIT).exists()
+    assert marker.read_text(encoding="utf-8") == "persistent"
+    assert not any(
+        command[:3] == ("systemctl", "--user", "restart")
+        for command, _ in processes.commands
+    )
 
 
 def test_validation_failure_preserves_previous_release(tmp_path):
@@ -384,3 +451,32 @@ def autoclip_service_test_manager(tmp_path):
         template_directory=autoclip_service.TEMPLATE_DIRECTORY,
         command_runner=command,
     ), command
+
+
+def test_repository_ignore_rule_covers_data_directory_and_symlink(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source_ignore = Path(__file__).resolve().parents[2] / ".gitignore"
+    (repository / ".gitignore").write_text(
+        source_ignore.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    subprocess.run(
+        ("git", "init", "-q"), cwd=repository, check=True,
+        capture_output=True, text=True,
+    )
+    data = repository / "data"
+    data.mkdir()
+    directory_check = subprocess.run(
+        ("git", "check-ignore", "data"), cwd=repository, check=False,
+        capture_output=True, text=True,
+    )
+    assert directory_check.returncode == 0
+    data.rmdir()
+    persistent = tmp_path / "persistent-data"
+    persistent.mkdir()
+    data.symlink_to(persistent)
+    symlink_check = subprocess.run(
+        ("git", "check-ignore", "data"), cwd=repository, check=False,
+        capture_output=True, text=True,
+    )
+    assert symlink_check.returncode == 0

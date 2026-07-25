@@ -111,11 +111,11 @@ class AutoClipServiceManager:
         support_python_path: Path | None = None,
         command_runner: CommandRunner = run_command,
     ) -> None:
-        self.project_root = Path(project_root).resolve()
+        self.project_root = Path(os.path.abspath(project_root))
         self.python_path = self.project_root / ".venv" / "bin" / "python"
         self.support_python_path = Path(
-            support_python_path or self.python_path
-        ).resolve()
+            os.path.abspath(support_python_path or self.python_path)
+        )
         self.unit_directory = Path(unit_directory).resolve()
         self.environment_file = Path(environment_file).resolve()
         self.template_directory = Path(
