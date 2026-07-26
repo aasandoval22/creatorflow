@@ -27,6 +27,7 @@ from backend.services.clip_review_queue import (
 from backend.services.clip_timing_adjustment import ClipTimingAdjustmentService
 from backend.services.reference_clip_comparator import ReferenceClipComparator
 from backend.services.reference_clip_library import ReferenceClipLibrary
+from backend.services.reference_decision_audit import ReferenceDecisionAuditError
 from backend.services.reference_profile_builder import ReferenceProfileBuilder
 from backend.services.reference_discovery import (
     ReferenceCandidateQueue, ReferenceDiscoveryError, ReferenceDiscoveryService,
@@ -401,6 +402,17 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             self._require_token(form)
             action = self._one(form, "action", required=True)
             note = self._one(form, "note") or ""
+            revision_value = self._one(
+                form, "expected_revision", required=True
+            )
+            try:
+                expected_revision = int(revision_value or "")
+            except ValueError as error:
+                raise RequestError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Candidate revision is invalid; refresh and retry.",
+                ) from error
+            request_id = self._one(form, "request_id", required=True)
             category = self._one(form, "category") or "gaming_highlight"
             topic = self._one(form, "topic")
             if len(note) > MAX_NOTE:
@@ -426,22 +438,54 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 service.accept(
                     video_id, category=category, notes=note,
                     transcription=False, topic=topic,
+                    expected_revision=expected_revision,
+                    request_id=request_id,
                 )
                 message = f"{video_id} was accepted and registered as a reference."
-            elif action in {"reject", "duplicate", "discovered"}:
-                queue.decide(
+            elif action in {"reject", "duplicate", "reconsider"}:
+                if service is None:
+                    raise ReferenceDiscoveryError(
+                        "Reference decisions are not configured."
+                    )
+                updated = service.transition(
                     video_id,
-                    "rejected" if action == "reject" else action,
-                    notes=note, category=category,
+                    action,
+                    notes=note,
+                    expected_revision=expected_revision,
+                    category=category,
                     topic=topic,
+                    request_id=request_id,
                 )
-                message = f"{video_id} is now {action}."
+                message = f"{video_id} is now {updated['status']}."
+            elif action == "withdraw":
+                if service is None:
+                    raise ReferenceDiscoveryError(
+                        "Reference withdrawal is not configured."
+                    )
+                confirmed = self._one(form, "confirm_withdrawal") == "yes"
+                result = service.withdraw(
+                    video_id,
+                    status="rejected",
+                    notes=note,
+                    expected_revision=expected_revision,
+                    confirmed=confirmed,
+                    request_id=request_id,
+                )
+                message = (
+                    f"{result['withdrawn_reference_id']} was withdrawn; "
+                    f"{video_id} is now rejected."
+                )
             else:
                 raise RequestError(HTTPStatus.BAD_REQUEST, "Invalid reference action.")
         except RequestError as error:
             self._text(error.status, error.message)
             return
-        except (ReferenceDiscoveryError, OSError, ValueError) as error:
+        except (
+            ReferenceDecisionAuditError,
+            ReferenceDiscoveryError,
+            OSError,
+            ValueError,
+        ) as error:
             self.log_error("reference candidate request failed: %s", error)
             self._reference_redirect(
                 "error", "Reference action failed; existing state was preserved."
@@ -528,12 +572,33 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             parameters = parse_qs(query)
             status = parameters.get("status", [None])[0]
             items = queue.list(status=status)
+            histories = {}
+            if (
+                self.server.app.reference_discovery_service is not None
+                and hasattr(
+                    self.server.app.reference_discovery_service, "history"
+                )
+            ):
+                histories = {
+                    item["video_id"]: (
+                        self.server.app.reference_discovery_service.history(
+                            item["video_id"], limit=5
+                        )
+                    )
+                    for item in items
+                }
             body = render_reference_candidates(
                 items, self.server.app.form_token,
+                histories=histories,
                 notice=parameters.get("success", parameters.get("error", [None]))[0],
                 notice_error="error" in parameters,
             ).encode()
-        except (ReferenceDiscoveryError, OSError, ValueError) as error:
+        except (
+            ReferenceDecisionAuditError,
+            ReferenceDiscoveryError,
+            OSError,
+            ValueError,
+        ) as error:
             self._text(HTTPStatus.BAD_REQUEST, str(error), head=head)
             return
         self._headers(HTTPStatus.OK, "text/html; charset=utf-8", len(body))
@@ -723,6 +788,7 @@ textarea{{width:100%;min-height:5rem}}fieldset{{margin:.8rem 0;padding:.8rem}}la
 
 def render_reference_candidates(
     items: list[dict[str, Any]], token: str, *,
+    histories: dict[str, list[dict[str, Any]]] | None = None,
     notice: str | None = None, notice_error: bool = False,
 ) -> str:
     banner = (
@@ -730,9 +796,85 @@ def render_reference_candidates(
         if notice else ""
     )
     cards = []
-    hidden = f'<input type="hidden" name="form_token" value="{_e(token)}">'
+    histories = histories or {}
     for item in sorted(items, key=lambda value: (value.get("rank", 999), value["video_id"])):
         video_id = quote(item["video_id"], safe="")
+        revision = item.get("revision", 0)
+        history = histories.get(item["video_id"], [])
+        history_html = "".join(
+            "<li>"
+            f"{_e(event.get('timestamp'))}: "
+            f"{_e(event.get('action'))} — {_e(event.get('result'))}; "
+            f"{_e(event.get('previous_status'))} → "
+            f"{_e(event.get('resulting_status'))}; "
+            f"revision {_e(event.get('previous_revision'))} → "
+            f"{_e(event.get('resulting_revision'))}; "
+            f"reviewer {_e(event.get('reviewer') or 'not configured')}; "
+            f"note {_e(event.get('note') or '—')}"
+            + (
+                f"; reason {_e(event.get('failure_reason'))}"
+                if event.get("failure_reason") else ""
+            )
+            + "</li>"
+            for event in history
+        ) or "<li>No durable decision history exists yet.</li>"
+        common = (
+            f'<input type="hidden" name="form_token" value="{_e(token)}">'
+            f'<input type="hidden" name="expected_revision" value="{_e(revision)}">'
+        )
+        category_topic = (
+            '<label>Reference category'
+            f'<input name="category" value="{_e(item.get("category") or "gaming_highlight")}">'
+            '</label><label>Game/topic'
+            f'<input name="topic" value="{_e(item.get("topic") or "unknown-gaming")}">'
+            "</label>"
+        )
+        status = item.get("status")
+        if status == "discovered":
+            accept_request = secrets.token_urlsafe(16)
+            decision_request = secrets.token_urlsafe(16)
+            actions = f"""
+<form method="post" action="/reference-candidates/{video_id}/decision">
+{common}<input type="hidden" name="request_id" value="{_e(accept_request)}">
+{category_topic}
+<label>Acceptance note (optional)<textarea name="note" maxlength="{MAX_NOTE}"></textarea></label>
+<button name="action" value="accept">Accept as reference</button>
+</form>
+<form method="post" action="/reference-candidates/{video_id}/decision">
+{common}<input type="hidden" name="request_id" value="{_e(decision_request)}">
+{category_topic}
+<label>Decision reason (required)<textarea name="note" maxlength="{MAX_NOTE}" required></textarea></label>
+<button name="action" value="reject">Reject</button>
+<button name="action" value="duplicate">Mark duplicate</button>
+</form>"""
+        elif status == "accepted" or (
+            status == "rejected"
+            and item.get("accepted_reference_id") is not None
+        ):
+            request_id = secrets.token_urlsafe(16)
+            actions = f"""
+<form method="post" action="/reference-candidates/{video_id}/decision">
+{common}<input type="hidden" name="request_id" value="{_e(request_id)}">
+<fieldset><legend>Withdraw Reference</legend>
+<p class="danger">Withdrawal removes this accepted reference from the strict
+reference index, moves its accepted artifacts to local recovery storage, and
+prevents future profile use. It does not delete the discovery preview.</p>
+<label>Withdrawal reason (required)<textarea name="note" maxlength="{MAX_NOTE}" required></textarea></label>
+<label><input type="checkbox" name="confirm_withdrawal" value="yes" required>
+I confirm that this accepted reference should be withdrawn.</label>
+<button name="action" value="withdraw">Withdraw Reference</button>
+</fieldset></form>"""
+        elif status in {"rejected", "duplicate"}:
+            request_id = secrets.token_urlsafe(16)
+            actions = f"""
+<form method="post" action="/reference-candidates/{video_id}/decision">
+{common}<input type="hidden" name="request_id" value="{_e(request_id)}">
+{category_topic}
+<p>Reconsider returns this candidate to discovered without accepting it.</p>
+<button name="action" value="reconsider">Reconsider</button>
+</form>"""
+        else:
+            actions = "<p>No state-changing action is available.</p>"
         media = (
             f'<video controls preload="metadata" src="/reference-media/{video_id}"></video>'
             if item.get("media_path") else
@@ -767,17 +909,9 @@ media evidence={_e(item.get('media_verification'))}</p>
 audio={_e(item.get('has_audio'))}</p>
 <p><strong>Transcript/structure:</strong> {_e(item.get('analysis_summary') or 'Unavailable until accepted analysis')}</p>
 <p><a href="{_e(item.get('source_url'))}" rel="noreferrer">Open public source</a></p>
-<form method="post" action="/reference-candidates/{video_id}/decision">
-{hidden}<label>Reference category
-<input name="category" value="{_e(item.get('category') or 'gaming_highlight')}"></label>
-<label>Game/topic
-<input name="topic" value="{_e(item.get('topic') or 'unknown-gaming')}"></label>
-<label>Notes<textarea name="note" maxlength="{MAX_NOTE}">{_e(item.get('notes') or '')}</textarea></label>
-<button name="action" value="accept">Accept as reference</button>
-<button name="action" value="reject">Reject</button>
-<button name="action" value="duplicate">Mark duplicate</button>
-<button name="action" value="discovered">Leave pending</button>
-</form></div></article>"""
+<p><strong>Revision:</strong> {_e(revision)}</p>
+<section><h3>Recent decision history</h3><ul>{history_html}</ul></section>
+{actions}</div></article>"""
         )
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">

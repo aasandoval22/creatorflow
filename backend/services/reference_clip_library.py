@@ -316,6 +316,18 @@ class ReferenceClipLibrary:
                 return copy.deepcopy(item)
         raise ReferenceClipError(f"Reference {reference_id!r} is not registered.")
 
+    def snapshot_index(self) -> dict[str, Any]:
+        """Return a validated copy for a coordinated local transaction."""
+
+        return copy.deepcopy(self._load())
+
+    def restore_index(self, document: dict[str, Any]) -> None:
+        """Atomically restore a previously validated transaction snapshot."""
+
+        restored = copy.deepcopy(document)
+        self._validate_index(restored)
+        _atomic_json(self.index_path, restored)
+
     def validate_checksum(self, reference_id: str) -> bool:
         entry = self.get(reference_id)
         path = Path(entry["media_path"])

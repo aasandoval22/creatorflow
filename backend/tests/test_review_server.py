@@ -237,15 +237,53 @@ class FakeReferenceDiscovery:
         self.queue = queue
         self.accepted = []
 
-    def accept(self, video_id, *, category, notes, transcription, topic=None):
+    def accept(
+        self, video_id, *, category, notes, transcription, topic=None,
+        expected_revision=None, request_id=None,
+    ):
         self.accepted.append(
             (video_id, category, notes, transcription, topic)
         )
-        self.queue.decide(
-            video_id, "accepted", notes=notes, category=category,
-            topic=topic,
+        self.queue.transition(
+            video_id, expected_revision=expected_revision,
+            expected_status="discovered", status="accepted",
+            notes=notes, category=category, topic=topic,
             accepted_reference_id=f"youtube-{video_id}",
         )
+
+    def transition(
+        self, video_id, action, *, notes, expected_revision,
+        category=None, topic=None, request_id=None,
+    ):
+        target = {
+            "reject": "rejected",
+            "duplicate": "duplicate",
+            "reconsider": "discovered",
+        }[action]
+        return self.queue.transition(
+            video_id, expected_revision=expected_revision,
+            expected_status=self.queue.get(video_id)["status"],
+            status=target, notes=notes, category=category, topic=topic,
+        )
+
+    def withdraw(
+        self, video_id, *, status, notes, expected_revision,
+        confirmed, request_id=None,
+    ):
+        if not confirmed:
+            raise ValueError("confirmation required")
+        updated = self.queue.transition(
+            video_id, expected_revision=expected_revision,
+            expected_status="accepted", status=status, notes=notes,
+            clear_accepted_reference=True,
+        )
+        return {
+            "candidate": updated,
+            "withdrawn_reference_id": f"youtube-{video_id}",
+        }
+
+    def history(self, video_id, *, limit=None):
+        return []
 
 
 def reference_candidate(tmp_path):
@@ -294,7 +332,8 @@ def test_reference_candidate_page_token_media_and_decisions(tmp_path):
             {
                 "form_token": "test-token", "action": "reject",
                 "category": "gaming_highlight", "topic": "manual-game",
-                "note": "repost",
+                "note": "repost", "expected_revision": "0",
+                "request_id": "reject-request",
             },
         )
         assert queue.get("short_one")["status"] == "rejected"
@@ -306,6 +345,8 @@ def test_reference_candidate_page_token_media_and_decisions(tmp_path):
                 "form_token": "test-token", "action": "accept",
                 "category": "personality_reaction", "topic": "roblox",
                 "note": "complete beat",
+                "expected_revision": str(queue.get("short_one")["revision"]),
+                "request_id": "accept-request",
             },
         )
     text = body.decode()
@@ -323,6 +364,134 @@ def test_reference_candidate_page_token_media_and_decisions(tmp_path):
     ]
     assert queue.get("short_one")["status"] == "accepted"
     assert queue.get("short_one")["topic"] == "roblox"
+
+
+def test_reference_candidate_page_renders_only_legal_actions(tmp_path):
+    item = reference_candidate(tmp_path) | {
+        "status": "discovered", "revision": 4, "notes": "",
+    }
+    discovered = review_server.render_reference_candidates(
+        [item], "test-token"
+    )
+    assert 'value="accept"' in discovered
+    assert 'value="reject"' in discovered
+    assert 'value="duplicate"' in discovered
+    assert 'value="withdraw"' not in discovered
+    assert 'value="reconsider"' not in discovered
+    assert 'name="expected_revision" value="4"' in discovered
+
+    accepted = review_server.render_reference_candidates(
+        [item | {
+            "status": "accepted",
+            "accepted_reference_id": "youtube-short_one",
+        }],
+        "test-token",
+    )
+    assert 'value="withdraw"' in accepted
+    assert "Withdraw Reference" in accepted
+    assert 'name="confirm_withdrawal" value="yes" required' in accepted
+    assert 'value="accept"' not in accepted
+    assert 'value="reject"' not in accepted
+
+    for status in ("rejected", "duplicate"):
+        rendered = review_server.render_reference_candidates(
+            [item | {"status": status}], "test-token"
+        )
+        assert 'value="reconsider"' in rendered
+        assert 'value="accept"' not in rendered
+        assert 'value="reject"' not in rendered
+        assert 'value="withdraw"' not in rendered
+
+    inconsistent = review_server.render_reference_candidates(
+        [
+            item | {
+                "status": "rejected",
+                "accepted_reference_id": "youtube-short_one",
+            }
+        ],
+        "test-token",
+    )
+    assert 'value="withdraw"' in inconsistent
+    assert 'value="reconsider"' not in inconsistent
+
+
+def test_reference_candidate_history_is_sanitized_and_token_stays_in_body(
+    tmp_path,
+):
+    item = reference_candidate(tmp_path) | {
+        "status": "rejected", "revision": 1, "notes": "",
+    }
+    event = {
+        "timestamp": "2026-07-25T00:00:00+00:00",
+        "action": "reject", "result": "success",
+        "previous_status": "discovered", "resulting_status": "rejected",
+        "previous_revision": 0, "resulting_revision": 1,
+        "reviewer": "Local reviewer", "note": "Weak setup",
+        "failure_reason": None,
+    }
+    rendered = review_server.render_reference_candidates(
+        [item], "test-token", histories={"short_one": [event]}
+    )
+    assert "Local reviewer" in rendered and "Weak setup" in rendered
+    assert 'name="form_token" value="test-token"' in rendered
+    assert "test-token" not in (
+        "/reference-candidates/short_one/decision"
+        + "/reference-media/short_one"
+    )
+
+
+def test_reference_candidate_withdraw_requires_confirmation(tmp_path):
+    with running_server(tmp_path) as (server, _, _):
+        queue = ReferenceCandidateQueue(
+            tmp_path / "reference-candidates.json"
+        )
+        queue.upsert_discovered([reference_candidate(tmp_path)])
+        queue.transition(
+            "short_one", expected_revision=0,
+            expected_status="discovered", status="accepted",
+            accepted_reference_id="youtube-short_one",
+        )
+        service = FakeReferenceDiscovery(queue)
+        server.app.reference_candidate_queue = queue
+        server.app.reference_discovery_service = service
+        before = queue.path.read_bytes()
+        status, headers, _ = post(
+            server,
+            "/reference-candidates/short_one/decision",
+            {
+                "form_token": "test-token", "action": "withdraw",
+                "note": "Not representative",
+                "expected_revision": str(
+                    queue.get("short_one")["revision"]
+                ),
+                "request_id": "withdraw-request",
+            },
+        )
+    assert status == 303 and "error=" in headers["Location"]
+    assert queue.path.read_bytes() == before
+
+
+def test_reference_candidate_stale_revision_is_nonmutating(tmp_path):
+    with running_server(tmp_path) as (server, _, _):
+        queue = ReferenceCandidateQueue(
+            tmp_path / "reference-candidates.json"
+        )
+        queue.upsert_discovered([reference_candidate(tmp_path)])
+        service = FakeReferenceDiscovery(queue)
+        server.app.reference_candidate_queue = queue
+        server.app.reference_discovery_service = service
+        before = queue.path.read_bytes()
+        status, headers, _ = post(
+            server,
+            "/reference-candidates/short_one/decision",
+            {
+                "form_token": "test-token", "action": "reject",
+                "note": "Not representative", "expected_revision": "9",
+                "request_id": "stale-request",
+            },
+        )
+    assert status == 303 and "error=" in headers["Location"]
+    assert queue.path.read_bytes() == before
 
 
 def test_reference_candidate_form_rejects_bad_token(tmp_path):
@@ -349,6 +518,8 @@ def test_reference_candidate_form_rejects_invalid_manual_topic(tmp_path):
                 "form_token": "test-token",
                 "action": "reject",
                 "topic": "../not-a-topic",
+                "expected_revision": "0",
+                "request_id": "invalid-topic",
             },
         )
     assert status == 400

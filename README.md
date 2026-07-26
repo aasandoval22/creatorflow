@@ -521,6 +521,7 @@ Commands:
 .venv/bin/python -m backend.services.reference_discovery show VIDEO_ID
 .venv/bin/python -m backend.services.reference_discovery refresh-stats
 .venv/bin/python -m backend.services.reference_discovery validate
+.venv/bin/python -m backend.services.reference_discovery history VIDEO_ID
 ```
 
 Discovery uses several documented default searches: funny gaming moments,
@@ -600,15 +601,70 @@ queue state. Repeating migration after success is a no-op.
 Open `/reference-candidates` on the existing loopback review server. Each card
 shows the public source, local preview when retained, creator, publication and
 capture times, statistics, cohort, gaming/source evidence, validation stage,
-ranking evidence, media measurements, and any available analysis. A reviewer
-can leave notes, correct the inferred game/topic, assign a category, reject,
-mark a duplicate, or accept. Manual topic corrections survive rediscovery and
-statistics refresh. Acceptance creates a distinguishable
+ranking evidence, media measurements, current revision, recent sanitized
+decision events, and any available analysis. A reviewer can leave notes,
+correct the inferred game/topic, and use only actions legal for the current
+state. Discovered candidates can be accepted, rejected, or marked duplicate.
+Rejected and duplicate candidates can be explicitly reconsidered. Accepted
+candidates can only be rejected through the confirmed **Withdraw Reference**
+operation; ordinary rejection cannot silently detach queue state from the
+strict reference index.
+
+Reject, duplicate, and withdrawal require a meaningful reviewer note.
+Acceptance notes remain optional. Set an optional display label in the private
+service environment:
+
+```text
+AUTOCLIP_REVIEWER_NAME=Your display name
+```
+
+The label is audit metadata, not an authentication identity. Form submissions
+include the candidate's current revision and a request ID. Stale or replayed
+forms fail without changing queue state, timestamps, references, or audit
+history. GET, HEAD, preview preload, refresh, and ordinary navigation remain
+read-only. State-changing requests continue to require the in-memory form
+token through a hidden POST field; it is never put in URLs, redirects, media
+requests, journals, or audit events.
+
+Manual topic corrections survive rediscovery and statistics refresh.
+Acceptance creates a distinguishable
 `automatic_youtube_discovery` source snapshot and then uses the existing strict
-reference registration and analysis pipeline. Profile rebuilding remains a
-separate explicit action. Rejected and merely discovered candidates never
-influence profiles. No discovery or review action republishes, remixes, or
-uploads media.
+reference registration and analysis pipeline. Registration, analysis, queue
+update, and audit persistence roll back together on failure.
+
+Withdrawal validates reference ownership, checksum, expected artifacts, and
+the retained discovery preview. It refuses when any generated profile still
+lists the reference. On success it atomically removes the strict-index entry,
+clears `accepted_reference_id`, advances the candidate revision, and moves the
+accepted-reference directory into ignored local recovery storage under
+`data/reference_discovery/withdrawal_recovery/`. The retained discovery media
+is not deleted. Profiles are never rebuilt automatically.
+
+The append-only local ledger is
+`data/reference_discovery/decision_events.jsonl`. Events contain the action,
+previous/requested/resulting state, revisions, reference IDs, outcome, safe
+failure reason, reviewer display label, note, and request ID. They never
+contain form tokens, API keys, cookies, authorization headers, or environment
+values. Historical decisions made before the ledger remain historical; the
+system does not invent actor or reason data for them.
+
+Consistency validation is non-destructive and returns nonzero for queue/index
+ownership, status, category, or profile-input mismatches:
+
+```bash
+.venv/bin/python -m backend.services.reference_discovery validate
+```
+
+After explicit human confirmation, an accepted reference can also be withdrawn
+through the same service-layer transaction from the CLI:
+
+```bash
+.venv/bin/python -m backend.services.reference_discovery withdraw VIDEO_ID \
+  --status rejected \
+  --note "Does not match the desired clip style"
+```
+
+No discovery or review action republishes, remixes, or uploads media.
 
 ### Review-time timing correction
 
