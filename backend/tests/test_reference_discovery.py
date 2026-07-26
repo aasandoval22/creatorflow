@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import importlib.metadata
 import json
 from datetime import datetime, timezone
 from io import BytesIO, StringIO
@@ -8,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from packaging.requirements import Requirement
 
 from backend.services.reference_clip_library import ReferenceClipLibrary
 from backend.services.reference_discovery import (
@@ -88,6 +91,41 @@ def test_reference_validation_and_downloader_share_explicit_deno_options(
     ] == expected
     assert downloader._metadata_options()["js_runtimes"] == expected
     assert downloader._build_options()["js_runtimes"] == expected
+    assert "remote_components" not in validator._download_options(
+        tmp_path / "candidate.mp4"
+    )
+    assert "remote_components" not in downloader._metadata_options()
+    assert "remote_components" not in downloader._build_options()
+
+
+def test_installed_ejs_matches_ytdlp_declared_default_requirement():
+    yt_dlp_version = importlib.metadata.version("yt-dlp")
+    ejs_version = importlib.metadata.version("yt-dlp-ejs")
+    requirements = [
+        Requirement(value)
+        for value in importlib.metadata.requires("yt-dlp") or []
+        if Requirement(value).name == "yt-dlp-ejs"
+    ]
+
+    assert yt_dlp_version
+    assert ejs_version
+    assert any(
+        requirement.marker is not None
+        and requirement.marker.evaluate({"extra": "default"})
+        and requirement.specifier.contains(ejs_version)
+        for requirement in requirements
+    )
+
+    distribution = importlib.metadata.distribution("yt-dlp-ejs")
+    files = {str(path) for path in distribution.files or []}
+    assert "yt_dlp_ejs/yt/solver/core.min.js" in files
+    assert "yt_dlp_ejs/yt/solver/lib.min.js" in files
+
+
+def test_ytdlp_detects_locally_installed_ejs_scripts():
+    from yt_dlp import dependencies
+
+    assert dependencies.yt_dlp_ejs is not None
 
 
 def test_reference_validation_detects_standard_deno_without_shell_path(
@@ -863,6 +901,267 @@ def test_atomic_queue_write_leaves_no_temporary_file(tmp_path):
     assert not list(tmp_path.glob(".*.tmp"))
 
 
+def _write_candidate_queue(path, items):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-07-25T00:00:00+00:00",
+                "items": items,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_queue_stores_canonical_persistent_candidate_media_path(tmp_path):
+    data_root = tmp_path / "persistent" / "data"
+    media = data_root / "reference_discovery" / "media" / "one.mp4"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"candidate-media")
+    queue = ReferenceCandidateQueue(
+        tmp_path / "queue-copy" / "candidates.json",
+        data_root=data_root,
+    )
+
+    queue.upsert_discovered(
+        [candidate() | {"media_path": str(media), "rank": 1}]
+    )
+
+    assert queue.get("one")["media_path"] == (
+        "reference_discovery/media/one.mp4"
+    )
+    assert queue.resolve_media_path(
+        "reference_discovery/media/one.mp4"
+    ) == media.resolve()
+
+
+def test_canonical_media_path_survives_release_pruning(tmp_path):
+    data_root = tmp_path / "persistent" / "data"
+    media = data_root / "reference_discovery" / "media" / "one.mp4"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"candidate-media")
+    release = (
+        tmp_path / "clip-factory-production" / "releases" / ("a" * 40)
+    )
+    release.mkdir(parents=True)
+    (release / "data").symlink_to(data_root)
+    queue = ReferenceCandidateQueue(
+        data_root / "reference_discovery" / "candidates.json",
+        data_root=data_root,
+    )
+    queue.upsert_discovered(
+        [
+            candidate()
+            | {
+                "media_path": str(
+                    release / "data" / "reference_discovery" / "media"
+                    / "one.mp4"
+                ),
+                "rank": 1,
+            }
+        ]
+    )
+
+    (release / "data").unlink()
+    release.rmdir()
+
+    item = queue.get("one")
+    assert item["media_path"] == "reference_discovery/media/one.mp4"
+    assert queue.resolve_media_path(item["media_path"]) == media.resolve()
+
+
+def test_legacy_release_path_migration_is_atomic_and_preserves_fields(
+    tmp_path,
+):
+    data_root = tmp_path / "persistent" / "data"
+    media = data_root / "reference_discovery" / "media" / "one.mp4"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"candidate-media")
+    queue_path = tmp_path / "queue-copy" / "candidates.json"
+    legacy = (
+        tmp_path / "clip-factory-production" / "releases" / ("a" * 40)
+        / "data" / "reference_discovery" / "media" / "one.mp4"
+    )
+    item = candidate() | {
+        "status": "discovered",
+        "media_path": str(legacy),
+        "notes": "preserve this note",
+        "category": "personality_reaction",
+        "topic": "manual-game",
+        "topic_manually_corrected": True,
+        "rank": 7,
+        "ranking": {"version": 2, "total": 88.5},
+        "accepted_reference_id": None,
+    }
+    _write_candidate_queue(queue_path, [item])
+    queue = ReferenceCandidateQueue(queue_path, data_root=data_root)
+    before = copy.deepcopy(queue.get("one"))
+    inode = media.stat().st_ino
+
+    dry_run = queue.migrate_media_paths(dry_run=True)
+    assert dry_run["changed_count"] == 1
+    assert queue.get("one") == before
+    result = queue.migrate_media_paths()
+
+    after = queue.get("one")
+    assert result["changed_count"] == 1
+    assert after["media_path"] == "reference_discovery/media/one.mp4"
+    assert {
+        name: value for name, value in before.items() if name != "media_path"
+    } == {
+        name: value for name, value in after.items() if name != "media_path"
+    }
+    assert media.stat().st_ino == inode
+    assert [path.name for path in media.parent.iterdir()] == ["one.mp4"]
+
+    migrated_bytes = queue_path.read_bytes()
+    assert queue.migrate_media_paths()["changed_count"] == 0
+    assert queue_path.read_bytes() == migrated_bytes
+
+
+def test_missing_legacy_media_aborts_migration_without_queue_change(tmp_path):
+    data_root = tmp_path / "persistent" / "data"
+    queue_path = tmp_path / "queue-copy" / "candidates.json"
+    legacy = (
+        tmp_path / "clip-factory-production" / "releases" / ("b" * 40)
+        / "data" / "reference_discovery" / "media" / "missing.mp4"
+    )
+    _write_candidate_queue(
+        queue_path,
+        [candidate() | {
+            "status": "discovered", "media_path": str(legacy), "rank": 1,
+        }],
+    )
+    queue = ReferenceCandidateQueue(queue_path, data_root=data_root)
+    before = queue_path.read_bytes()
+
+    with pytest.raises(
+        ReferenceDiscoveryError, match="missing.*Queue state was not changed"
+    ):
+        queue.migrate_media_paths()
+
+    assert queue_path.read_bytes() == before
+
+
+def test_migration_failure_after_valid_item_is_still_atomic(tmp_path):
+    data_root = tmp_path / "persistent" / "data"
+    media = data_root / "reference_discovery" / "media" / "one.mp4"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"candidate-media")
+    release_root = (
+        tmp_path / "clip-factory-production" / "releases" / ("b" * 40)
+        / "data" / "reference_discovery" / "media"
+    )
+    queue_path = tmp_path / "queue-copy" / "candidates.json"
+    _write_candidate_queue(
+        queue_path,
+        [
+            candidate("one") | {
+                "status": "discovered",
+                "media_path": str(release_root / "one.mp4"),
+                "rank": 1,
+            },
+            candidate("two") | {
+                "status": "rejected",
+                "media_path": str(release_root / "missing.mp4"),
+                "rank": 2,
+            },
+        ],
+    )
+    queue = ReferenceCandidateQueue(queue_path, data_root=data_root)
+    before = queue_path.read_bytes()
+
+    with pytest.raises(ReferenceDiscoveryError, match="missing"):
+        queue.migrate_media_paths()
+
+    assert queue_path.read_bytes() == before
+
+
+def test_validation_identifies_noncanonical_release_bound_path(tmp_path):
+    data_root = tmp_path / "persistent" / "data"
+    media = data_root / "reference_discovery" / "media" / "one.mp4"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"candidate-media")
+    queue_path = tmp_path / "queue-copy" / "candidates.json"
+    legacy = (
+        tmp_path / "clip-factory-production" / "releases" / ("c" * 40)
+        / "data" / "reference_discovery" / "media" / "one.mp4"
+    )
+    _write_candidate_queue(
+        queue_path,
+        [candidate() | {
+            "status": "discovered", "media_path": str(legacy), "rank": 1,
+        }],
+    )
+    queue = ReferenceCandidateQueue(queue_path, data_root=data_root)
+
+    with pytest.raises(
+        ReferenceDiscoveryError, match="noncanonical.*migrate-media-paths"
+    ):
+        queue.validate_media_paths()
+    assert queue.resolve_media_path(str(legacy)) == media.resolve()
+
+
+def test_canonical_media_symlink_cannot_escape_persistent_media_root(tmp_path):
+    data_root = tmp_path / "persistent" / "data"
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"outside")
+    media = data_root / "reference_discovery" / "media" / "one.mp4"
+    media.parent.mkdir(parents=True)
+    media.symlink_to(outside)
+    queue = ReferenceCandidateQueue(
+        data_root / "reference_discovery" / "candidates.json",
+        data_root=data_root,
+    )
+
+    with pytest.raises(ReferenceDiscoveryError, match="resolves outside"):
+        queue.canonical_media_path("reference_discovery/media/one.mp4")
+
+
+def test_cli_migrates_paths_against_explicit_persistent_data_root(
+    tmp_path, capsys,
+):
+    data_root = tmp_path / "persistent" / "data"
+    media = data_root / "reference_discovery" / "media" / "one.mp4"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"candidate-media")
+    queue_path = tmp_path / "queue-copy" / "candidates.json"
+    legacy = (
+        tmp_path / "clip-factory-production" / "current" / "data"
+        / "reference_discovery" / "media" / "one.mp4"
+    )
+    _write_candidate_queue(
+        queue_path,
+        [candidate() | {
+            "status": "discovered", "media_path": str(legacy), "rank": 1,
+        }],
+    )
+
+    assert main(
+        [
+            "--queue-path", str(queue_path),
+            "--data-root", str(data_root),
+            "migrate-media-paths",
+        ]
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out)["changed_count"] == 1
+    assert ReferenceCandidateQueue(
+        queue_path, data_root=data_root
+    ).get("one")["media_path"] == "reference_discovery/media/one.mp4"
+
+
+def test_reference_discovery_cli_has_no_publishing_command(capsys):
+    with pytest.raises(SystemExit):
+        main(["publish"])
+    assert "invalid choice" in capsys.readouterr().err
+
+
 class FakeAnalyzer:
     calls = []
 
@@ -883,7 +1182,8 @@ class FailingAnalyzer:
 
 
 def test_acceptance_uses_strict_reference_registration_and_analysis(tmp_path):
-    media = tmp_path / "candidate.mp4"
+    media = tmp_path / "reference_discovery" / "media" / "candidate.mp4"
+    media.parent.mkdir(parents=True)
     media.write_bytes(b"local-media")
     queue = ReferenceCandidateQueue(tmp_path / "candidates.json")
     item = candidate() | {"media_path": str(media), "rank": 1}
@@ -903,15 +1203,53 @@ def test_acceptance_uses_strict_reference_registration_and_analysis(tmp_path):
     assert entry["status"] == "accepted"
     assert library.list_references(status="accepted") == [entry]
     assert FakeAnalyzer.calls == [("youtube-one", False)]
+    assert service.media_validator.calls == []
     assert queue.get("one")["status"] == "accepted"
     assert queue.get("one")["topic"] == "manual-game"
     source = json.loads(Path(entry["source_info_path"]).read_text())
     assert source["origin"] == "automatic_youtube_discovery"
     assert source["metadata_snapshot"]["topic"] == "manual-game"
+    assert source["metadata_snapshot"]["media_path"] == (
+        "reference_discovery/media/candidate.mp4"
+    )
+
+
+def test_acceptance_reports_missing_canonical_media_without_redownload(
+    tmp_path,
+):
+    data_root = tmp_path / "persistent" / "data"
+    media = data_root / "reference_discovery" / "media" / "candidate.mp4"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"local-media")
+    queue = ReferenceCandidateQueue(
+        data_root / "reference_discovery" / "candidates.json",
+        data_root=data_root,
+    )
+    queue.upsert_discovered(
+        [candidate() | {"media_path": str(media), "rank": 1}]
+    )
+    media.unlink()
+    validator = FakeValidator(media)
+    service = ReferenceDiscoveryService(
+        FakeAPI([]), queue, media_validator=validator,
+        reference_library=ReferenceClipLibrary(tmp_path / "references"),
+        analyzer_factory=FakeAnalyzer,
+        reference_root=tmp_path / "references",
+    )
+
+    with pytest.raises(
+        ReferenceDiscoveryError,
+        match="Candidate media is unavailable.*Queue state was not changed",
+    ):
+        service.accept("one", category="gaming_highlight", notes="candidate")
+
+    assert validator.calls == []
+    assert queue.get("one")["status"] == "discovered"
 
 
 def test_failed_analysis_rolls_back_reference_and_preserves_candidate(tmp_path):
-    media = tmp_path / "candidate.mp4"
+    media = tmp_path / "reference_discovery" / "media" / "candidate.mp4"
+    media.parent.mkdir(parents=True)
     media.write_bytes(b"local-media")
     queue = ReferenceCandidateQueue(tmp_path / "candidates.json")
     queue.upsert_discovered([candidate() | {"media_path": str(media), "rank": 1}])
@@ -936,6 +1274,15 @@ def test_rejection_never_registers_or_influences_references(tmp_path):
     library = ReferenceClipLibrary(tmp_path / "references")
     assert library.list_references(status="accepted") == []
     assert queue.get("one")["status"] == "rejected"
+    service = ReferenceDiscoveryService(
+        FakeAPI([]), queue, reference_library=library,
+        reference_root=tmp_path / "references",
+    )
+    with pytest.raises(
+        ReferenceDiscoveryError, match="Only discovered candidates"
+    ):
+        service.accept("one", category="gaming_highlight", notes="repost")
+    assert library.list_references() == []
 
 
 def test_cli_missing_key_returns_nonzero_without_exposing_value(tmp_path, monkeypatch, capsys):

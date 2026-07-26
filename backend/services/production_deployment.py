@@ -302,7 +302,12 @@ class ProductionDeployer:
         self._run(
             (
                 str(python), "-c",
-                "import yt_dlp; import backend.services.production_runner; "
+                "import yt_dlp; import yt_dlp_ejs; "
+                "from importlib.resources import files; "
+                "solver = files('yt_dlp_ejs.yt.solver'); "
+                "assert solver.joinpath('core.min.js').is_file(); "
+                "assert solver.joinpath('lib.min.js').is_file(); "
+                "import backend.services.production_runner; "
                 "import backend.app.review_server",
             ),
             cwd=release, purpose="release import validation",
