@@ -550,12 +550,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             path_value = item.get("media_path")
             if not isinstance(path_value, str):
                 raise OSError
-            path = Path(path_value).resolve()
-            media_root = queue.path.parent.resolve()
-            if not path.is_relative_to(media_root):
-                raise OSError
-            if not path.is_file():
-                raise OSError
+            path = queue.resolve_media_path(path_value)
             size = path.stat().st_size
         except (ReferenceDiscoveryError, OSError):
             self._text(HTTPStatus.NOT_FOUND, "Candidate media was not found.", head=head)

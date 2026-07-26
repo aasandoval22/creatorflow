@@ -249,7 +249,11 @@ class FakeReferenceDiscovery:
 
 
 def reference_candidate(tmp_path):
-    media = tmp_path / "reference-candidate.mp4"
+    media = (
+        tmp_path / "reference_discovery" / "media"
+        / "reference-candidate.mp4"
+    )
+    media.parent.mkdir(parents=True, exist_ok=True)
     media.write_bytes(b"reference-media")
     return {
         "video_id": "short_one",
@@ -275,6 +279,9 @@ def test_reference_candidate_page_token_media_and_decisions(tmp_path):
     with running_server(tmp_path) as (server, _, _):
         queue = ReferenceCandidateQueue(tmp_path / "reference-candidates.json")
         queue.upsert_discovered([reference_candidate(tmp_path)])
+        assert queue.get("short_one")["media_path"] == (
+            "reference_discovery/media/reference-candidate.mp4"
+        )
         service = FakeReferenceDiscovery(queue)
         server.app.reference_candidate_queue = queue
         server.app.reference_discovery_service = service
@@ -356,7 +363,16 @@ def test_reference_media_cannot_escape_discovery_directory(tmp_path):
             queue = ReferenceCandidateQueue(tmp_path / "reference-candidates.json")
             item = reference_candidate(tmp_path)
             item["media_path"] = str(outside)
-            queue.upsert_discovered([item])
+            queue.path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "updated_at": "2026-07-25T00:00:00+00:00",
+                        "items": [{**item, "status": "discovered"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
             server.app.reference_candidate_queue = queue
             status, _, body = request(
                 server, "GET", "/reference-media/short_one"

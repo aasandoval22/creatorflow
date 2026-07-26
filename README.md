@@ -166,8 +166,11 @@ runtime. CreatorFlow's production downloader and reference-discovery media
 validator share the same configuration: they check `AUTOCLIP_DENO_PATH`, then
 `~/.deno/bin/deno`, then `PATH`. This gives interactive and systemd-managed
 runs identical behavior even when the user service PATH omits the Deno install
-directory. If no executable runtime is available, yt-dlp continues with a
-clear warning because Deno is optional in offline development environments.
+directory. Production installs `yt-dlp[default]`, which lets yt-dlp select the
+compatible `yt-dlp-ejs` package containing its local challenge-solver scripts.
+Remote EJS component downloads are not enabled. If no executable runtime is
+available, yt-dlp continues with a clear warning because Deno is optional in
+offline development environments.
 
 Keep the review server loopback-bound. The managed unit always supplies
 `--host 127.0.0.1`; use an SSH tunnel for remote browser access as described
@@ -567,6 +570,32 @@ the reference-review queue. Search results alone are never treated as proof
 that a video is a Short. Metadata snapshots, scores, validation results,
 review state, and retained media are stored atomically under ignored
 `data/reference_discovery/`.
+
+Retained candidate media is stored under the persistent CreatorFlow data root
+and queue records use release-independent paths such as
+`reference_discovery/media/VIDEO_ID.mp4`. The queue resolves those paths
+against its configured data root, so release replacement and pruning do not
+break playback or later acceptance. Legacy absolute paths through a deployment
+release, `current`, or the development checkout remain readable but validation
+reports them as noncanonical.
+
+After deploying the release that introduces canonical paths, preview and then
+perform the atomic metadata-only migration:
+
+```bash
+cd /home/aasandoval/clip-factory-production/current
+.venv/bin/python -m backend.services.reference_discovery \
+  migrate-media-paths --dry-run
+.venv/bin/python -m backend.services.reference_discovery \
+  migrate-media-paths
+.venv/bin/python -m backend.services.reference_discovery validate
+```
+
+Migration verifies every referenced persistent media file before replacing the
+queue atomically. It rewrites only `media_path`, never copies, moves,
+redownloads, or deletes media, and does not change notes, decisions, topics,
+rankings, candidate IDs, or timestamps. A missing file aborts without changing
+queue state. Repeating migration after success is a no-op.
 
 Open `/reference-candidates` on the existing loopback review server. Each card
 shows the public source, local preview when retained, creator, publication and

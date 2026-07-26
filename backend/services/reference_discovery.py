@@ -32,9 +32,11 @@ from backend.services.youtube_downloader import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ROOT = PROJECT_ROOT / "data" / "reference_discovery"
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "data"
+REFERENCE_MEDIA_RELATIVE_ROOT = Path("reference_discovery") / "media"
+DEFAULT_ROOT = DEFAULT_DATA_ROOT / "reference_discovery"
 DEFAULT_QUEUE_PATH = DEFAULT_ROOT / "candidates.json"
-DEFAULT_MEDIA_ROOT = DEFAULT_ROOT / "media"
+DEFAULT_MEDIA_ROOT = DEFAULT_DATA_ROOT / REFERENCE_MEDIA_RELATIVE_ROOT
 DEFAULT_REFERENCE_ROOT = PROJECT_ROOT / "data" / "reference_clips"
 DEFAULT_ENVIRONMENT_FILE = Path.home() / ".config" / "creatorflow" / "creatorflow.env"
 QUEUE_VERSION = 1
@@ -695,7 +697,7 @@ class LocalMediaValidator:
             evidence = MediaEvidence(
                 True, duration, _optional_int(video.get("width")),
                 _optional_int(video.get("height")), rate, True, audio is not None,
-                str(completed) if retain else None,
+                str(completed.resolve()) if retain else None,
             )
             if not retain:
                 completed.unlink(missing_ok=True)
@@ -1129,14 +1131,191 @@ def select_diverse(
 
 
 class ReferenceCandidateQueue:
-    def __init__(self, path: Path = DEFAULT_QUEUE_PATH) -> None:
+    def __init__(
+        self, path: Path = DEFAULT_QUEUE_PATH, *,
+        data_root: Path | None = None,
+    ) -> None:
         self.path = Path(path)
+        self.data_root = (
+            Path(data_root)
+            if data_root is not None
+            else self._infer_data_root(self.path)
+        )
+        self.media_root = self.data_root / REFERENCE_MEDIA_RELATIVE_ROOT
         if self.path.exists():
             self._load()
 
     @staticmethod
+    def _infer_data_root(queue_path: Path) -> Path:
+        parent = queue_path.parent
+        if parent.name == "reference_discovery":
+            return parent.parent
+        return parent
+
+    @staticmethod
     def empty() -> dict[str, Any]:
         return {"version": QUEUE_VERSION, "updated_at": utc_now(), "items": []}
+
+    @staticmethod
+    def _canonical_relative_path(filename: str) -> str:
+        return (REFERENCE_MEDIA_RELATIVE_ROOT / filename).as_posix()
+
+    @staticmethod
+    def _relative_media_filename(value: str) -> str | None:
+        path = Path(value)
+        if path.is_absolute() or path.parts[:2] != (
+            "reference_discovery", "media"
+        ):
+            return None
+        if len(path.parts) != 3 or path.name in {"", ".", ".."}:
+            return None
+        return path.name
+
+    def _legacy_media_location(self, path: Path) -> Path | None:
+        """Map known release/current/development paths into persistent data."""
+
+        parts = path.parts
+        for index, part in enumerate(parts):
+            if part == "clip-factory-production":
+                tail_start: int | None = None
+                if (
+                    index + 2 < len(parts)
+                    and parts[index + 1] == "current"
+                    and parts[index + 2] == "data"
+                ):
+                    tail_start = index + 3
+                elif (
+                    index + 3 < len(parts)
+                    and parts[index + 1] == "releases"
+                    and re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", parts[index + 2])
+                    and parts[index + 3] == "data"
+                ):
+                    tail_start = index + 4
+                if tail_start is not None:
+                    relative = Path(*parts[tail_start:])
+                    filename = self._relative_media_filename(relative.as_posix())
+                    if filename is not None:
+                        return self.media_root / filename
+            if (
+                part == "clip-factory"
+                and index + 1 < len(parts)
+                and parts[index + 1] == "data"
+            ):
+                relative = Path(*parts[index + 2:])
+                filename = self._relative_media_filename(relative.as_posix())
+                if filename is not None:
+                    return self.media_root / filename
+        return None
+
+    def _media_location(self, value: str) -> tuple[Path, str]:
+        filename = self._relative_media_filename(value)
+        if filename is not None:
+            return (
+                self.media_root / filename,
+                self._canonical_relative_path(filename),
+            )
+        path = Path(value)
+        if not path.is_absolute():
+            raise ReferenceDiscoveryError(
+                f"Candidate media path {value!r} is not a canonical path under "
+                f"{REFERENCE_MEDIA_RELATIVE_ROOT.as_posix()}/."
+            )
+        resolved_root = self.media_root.resolve()
+        resolved_path = path.resolve()
+        if resolved_path.is_relative_to(resolved_root):
+            relative = resolved_path.relative_to(resolved_root)
+            if len(relative.parts) == 1:
+                return (
+                    self.media_root / relative.name,
+                    self._canonical_relative_path(relative.name),
+                )
+        legacy = self._legacy_media_location(path)
+        if legacy is not None:
+            return legacy, self._canonical_relative_path(legacy.name)
+        raise ReferenceDiscoveryError(
+            f"Candidate media path {value!r} is outside the configured "
+            f"persistent media directory {self.media_root}."
+        )
+
+    def resolve_media_path(
+        self, value: str, *, require_exists: bool = True,
+    ) -> Path:
+        path, _canonical = self._media_location(value)
+        if require_exists and not path.is_file():
+            raise ReferenceDiscoveryError(
+                f"Candidate media file is missing at {path}. Queue state was "
+                "not changed; restore the retained file before retrying."
+            )
+        resolved = path.resolve()
+        resolved_root = self.media_root.resolve()
+        if not resolved.is_relative_to(resolved_root):
+            raise ReferenceDiscoveryError(
+                f"Candidate media path {value!r} resolves outside the configured "
+                f"persistent media directory {self.media_root}."
+            )
+        return resolved
+
+    def canonical_media_path(self, value: str) -> str:
+        _path, canonical = self._media_location(value)
+        self.resolve_media_path(value)
+        return canonical
+
+    def validate_media_paths(self, *, require_canonical: bool = True) -> None:
+        problems = []
+        for item in self._load()["items"]:
+            value = item.get("media_path")
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value:
+                problems.append(
+                    f"{item.get('video_id', '<unknown>')}: media_path is malformed"
+                )
+                continue
+            try:
+                canonical = self.canonical_media_path(value)
+            except ReferenceDiscoveryError as error:
+                problems.append(f"{item['video_id']}: {error}")
+                continue
+            if require_canonical and value != canonical:
+                problems.append(
+                    f"{item['video_id']}: noncanonical media_path {value!r}; "
+                    "run migrate-media-paths"
+                )
+        if problems:
+            raise ReferenceDiscoveryError(
+                "Reference candidate media validation failed: "
+                + "; ".join(problems)
+            )
+
+    def migrate_media_paths(self, *, dry_run: bool = False) -> dict[str, Any]:
+        document = self._load()
+        changes = []
+        for item in document["items"]:
+            value = item.get("media_path")
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value:
+                raise ReferenceDiscoveryError(
+                    f"Reference candidate {item.get('video_id', '<unknown>')} "
+                    "has a malformed media_path; queue state was not changed."
+                )
+            canonical = self.canonical_media_path(value)
+            if value != canonical:
+                changes.append(
+                    {
+                        "video_id": item["video_id"],
+                        "previous_media_path": value,
+                        "media_path": canonical,
+                    }
+                )
+                item["media_path"] = canonical
+        if changes and not dry_run:
+            _atomic_json(self.path, document)
+        return {
+            "dry_run": dry_run,
+            "changed_count": len(changes),
+            "changes": changes,
+        }
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -1188,8 +1367,14 @@ class ReferenceCandidateQueue:
             previous = existing.get(candidate["video_id"])
             if previous and previous["status"] != "discovered":
                 continue
+            candidate_copy = copy.deepcopy(candidate)
+            media_path = candidate_copy.get("media_path")
+            if isinstance(media_path, str):
+                candidate_copy["media_path"] = self.canonical_media_path(
+                    media_path
+                )
             item = {
-                **copy.deepcopy(candidate),
+                **candidate_copy,
                 "status": "discovered",
                 "notes": (previous or {}).get("notes"),
                 "category": (previous or {}).get("category", "gaming_highlight"),
@@ -1495,19 +1680,26 @@ class ReferenceDiscoveryService:
             candidate["topic"] = topic
             candidate["topic_manually_corrected"] = True
         media_path = candidate.get("media_path")
-        if not isinstance(media_path, str) or not Path(media_path).is_file():
+        if isinstance(media_path, str):
+            try:
+                resolved_media_path = self.queue.resolve_media_path(media_path)
+            except ReferenceDiscoveryError as error:
+                raise ReferenceDiscoveryError(
+                    f"Candidate media is unavailable: {error}"
+                ) from error
+        else:
             evidence = self.media_validator.validate(candidate, retain=True)
             if not evidence.valid_short or not evidence.media_path:
                 raise ReferenceDiscoveryError(
                     f"Candidate media could not be validated: {evidence.error or 'invalid media'}."
                 )
-            media_path = evidence.media_path
+            resolved_media_path = Path(evidence.media_path)
         reference_id = f"youtube-{video_id}"
         directory = self.reference_root / f"discovered-{video_id}"
         directory.mkdir(parents=True, exist_ok=True)
         target_media = directory / "reference.mp4"
-        if Path(media_path).resolve() != target_media.resolve():
-            _copy_atomic(Path(media_path), target_media)
+        if resolved_media_path.resolve() != target_media.resolve():
+            _copy_atomic(resolved_media_path, target_media)
         baseline = {
             "version": 1, "reference_id": reference_id,
             "source_video_id": video_id, "source_title": candidate["title"],
@@ -1598,6 +1790,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="Discover public gaming Shorts for human reference review."
     )
     parser.add_argument("--queue-path", type=Path, default=DEFAULT_QUEUE_PATH)
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        help=(
+            "Persistent CreatorFlow data root used to resolve relative candidate "
+            "media paths. By default it is inferred from --queue-path."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     discover = sub.add_parser("discover")
     discover.add_argument("--dry-run", action="store_true")
@@ -1621,15 +1821,17 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("video_id")
     sub.add_parser("refresh-stats")
     sub.add_parser("validate")
+    migrate = sub.add_parser("migrate-media-paths")
+    migrate.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = ()) -> int:
     args = build_parser().parse_args(argv)
-    queue = ReferenceCandidateQueue(args.queue_path)
-    service = ReferenceDiscoveryService(YouTubeDataAPI(), queue)
+    queue = ReferenceCandidateQueue(args.queue_path, data_root=args.data_root)
     try:
         if args.command == "discover":
+            service = ReferenceDiscoveryService(YouTubeDataAPI(), queue)
             for value, label in (
                 (args.pool_size, "pool size"),
                 (args.publication_days, "publication days"),
@@ -1664,18 +1866,14 @@ def main(argv: Sequence[str] | None = ()) -> int:
         elif args.command == "show":
             print(json.dumps(queue.get(args.video_id), indent=2, sort_keys=True))
         elif args.command == "refresh-stats":
+            service = ReferenceDiscoveryService(YouTubeDataAPI(), queue)
             print(f"Refreshed {service.refresh_stats()} candidate(s).")
+        elif args.command == "migrate-media-paths":
+            result = queue.migrate_media_paths(dry_run=args.dry_run)
+            print(json.dumps(result, indent=2, sort_keys=True))
         else:
             items = queue.list()
-            missing_media = sum(
-                bool(item.get("media_path"))
-                and not Path(item["media_path"]).is_file()
-                for item in items
-            )
-            if missing_media:
-                raise ReferenceDiscoveryError(
-                    f"Queue is valid, but {missing_media} retained media file(s) are missing."
-                )
+            queue.validate_media_paths(require_canonical=True)
             print(f"Reference candidate queue is valid: {len(items)} item(s).")
     except (ReferenceDiscoveryError, ValueError) as error:
         print(f"Reference discovery failed: {error}", file=sys.stderr)

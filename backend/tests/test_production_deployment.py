@@ -250,7 +250,7 @@ class PreparationProcesses(FakeProcesses):
             requirements.parent.mkdir()
             requirements.write_text("-r requirements.txt\n", encoding="utf-8")
             (release / "backend" / "requirements.txt").write_text(
-                "yt-dlp\n", encoding="utf-8"
+                "yt-dlp[default]\n", encoding="utf-8"
             )
             self.commands.append((command, cwd))
             return ProcessResult(0)
@@ -293,6 +293,24 @@ def test_release_preparation_mocks_dependencies_and_validates_exact_commit(tmp_p
     assert test_command[0] == str(
         deployer.development_root / ".venv" / "bin" / "python"
     )
+    import_command = next(
+        command for command in commands
+        if len(command) > 2
+        and command[1] == "-c"
+        and "backend.services.production_runner" in command[2]
+    )
+    assert "import yt_dlp_ejs" in import_command[2]
+    assert "core.min.js" in import_command[2]
+    assert "lib.min.js" in import_command[2]
+
+
+def test_release_requirements_install_ytdlp_default_dependency_group():
+    requirements = (
+        Path(__file__).resolve().parents[1] / "requirements.txt"
+    ).read_text(encoding="utf-8").splitlines()
+
+    assert "yt-dlp[default]" in requirements
+    assert not any(line.startswith("yt-dlp-ejs") for line in requirements)
 
 
 def test_dependency_failure_removes_incomplete_release(tmp_path):
