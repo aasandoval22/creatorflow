@@ -13,7 +13,9 @@ import pytest
 
 from backend.app import review_server
 from backend.services.clip_review_queue import ClipReviewQueue, ReviewQueueError
+from backend.services.reference_annotations import default_annotation_values
 from backend.services.reference_discovery import ReferenceCandidateQueue
+from backend.tests.test_reference_evidence import environment as evidence_environment
 
 
 def candidate(identifier: str = "candidate_1", *, rank: int = 1, score: float = 90) -> dict:
@@ -713,3 +715,113 @@ def test_write_routes_reject_get_and_unknown_routes(tmp_path):
         rid = review_id(queue)
         assert request(server, "GET", f"/reviews/{rid}/decision")[0] == 405
         assert request(server, "GET", "/unknown")[0] == 404
+
+
+def test_accepted_reference_page_controls_media_analysis_and_post_only(tmp_path):
+    _, entries, annotations, _, _, evidence = evidence_environment(
+        tmp_path / "evidence", count=1
+    )
+    reference_id = entries[0]["reference_id"]
+    with running_server(tmp_path / "server") as (server, _, _):
+        server.app.reference_evidence_service = evidence
+        status, _, body = request(server, "GET", "/references")
+        text = body.decode()
+        assert status == 200
+        assert reference_id in text
+        assert "Human style annotations" in text
+        assert "Reanalyze with transcription" in text
+        assert "Rebuild gaming_highlight profile" in text
+        assert "Inspect complete sanitized analysis" in text
+        assert 'name="expected_annotation_revision" value="0"' in text
+        assert text.count('name="form_token" value="test-token"') == 3
+        assert "Withdraw Reference" not in text and "Delete reference" not in text
+        assert request(
+            server, "GET", f"/references/{reference_id}/annotations"
+        )[0] == 405
+        assert request(
+            server, "HEAD", f"/references/{reference_id}/reanalyze"
+        )[0] == 405
+        analysis_status, _, analysis_body = request(
+            server, "GET", f"/references/{reference_id}/analysis"
+        )
+        assert analysis_status == 200
+        assert b"sanitized analysis" in analysis_body
+        media_status, headers, media_body = request(
+            server, "GET", f"/accepted-reference-media/{reference_id}",
+            headers={"Range": "bytes=0-3"},
+        )
+        assert media_status == 206 and len(media_body) == 4
+        assert headers["Content-Range"].startswith("bytes 0-3/")
+    assert not annotations.exists(reference_id)
+
+
+def test_accepted_reference_annotation_stale_reanalysis_and_rebuild_posts(tmp_path):
+    _, entries, annotations, audit, builder, evidence = evidence_environment(
+        tmp_path / "evidence", count=1
+    )
+    reference_id = entries[0]["reference_id"]
+    values = default_annotation_values()
+    values.update({
+        "composition": "full_screen_gameplay",
+        "facecam_presence": "none",
+        "opening_style": "immediate_action",
+        "clip_purpose": "clutch_highlight",
+        "pacing": "fast",
+        "payoff_type": "gameplay_result",
+        "caption_style": "phrase_captions",
+    })
+    form = {
+        "form_token": "test-token",
+        "expected_annotation_revision": "0",
+        "request_id": "web-annotation",
+        **{name: str(values[name]) for name in (
+            "composition", "facecam_presence", "opening_style", "clip_purpose",
+            "pacing", "payoff_type", "caption_style",
+        )},
+        "desired_qualities": "complete result\nclear action",
+        "undesirable_qualities": "dead air",
+        "reviewer_notes": "Keep the payoff.",
+    }
+    with running_server(tmp_path / "server") as (server, _, _):
+        server.app.reference_evidence_service = evidence
+        status, headers, _ = post(
+            server, f"/references/{reference_id}/annotations", form
+        )
+        assert status == 303 and "success=" in headers["Location"]
+        assert annotations.read(reference_id)["revision"] == 1
+        annotation_before = annotations.path(reference_id).read_bytes()
+        audit_before = audit.path.read_bytes()
+        stale = dict(form, request_id="web-stale")
+        status, headers, _ = post(
+            server, f"/references/{reference_id}/annotations", stale
+        )
+        assert status == 303 and "error=" in headers["Location"]
+        assert annotations.path(reference_id).read_bytes() == annotation_before
+        assert audit.path.read_bytes() != audit_before
+        assert audit.history(reference_id=reference_id)[-1]["result"] == "failure"
+        status, headers, _ = post(
+            server,
+            f"/references/{reference_id}/reanalyze",
+            {
+                "form_token": "test-token",
+                "expected_annotation_revision": "1",
+                "request_id": "web-reanalyze",
+            },
+        )
+        assert status == 303 and "success=" in headers["Location"]
+        assert annotations.path(reference_id).read_bytes() == annotation_before
+        status, headers, _ = post(
+            server,
+            f"/references/{reference_id}/rebuild-profile",
+            {
+                "form_token": "test-token",
+                "expected_annotation_revision": "1",
+                "request_id": "web-profile",
+            },
+        )
+        assert status == 303 and "success=" in headers["Location"]
+    assert builder.read("gaming_highlight")["staleness"]["status"] == "current"
+    assert [event["action"] for event in audit.history(reference_id=reference_id)] == [
+        "annotation_update", "annotation_update", "reanalyze", "profile_rebuild",
+    ]
+    assert audit.history(profile_name="gaming_highlight")[-1]["action"] == "profile_rebuild"
