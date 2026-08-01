@@ -38,9 +38,12 @@ class ReferenceClipComparator:
     def compare(
         self, profile_name: str, review: dict[str, Any], *,
         metadata: dict[str, Any] | None = None, transcript: dict[str, Any] | None = None,
-        write: bool = False,
+        write: bool = False, profile_document: dict[str, Any] | None = None,
+        created_at: str | None = None,
     ) -> dict[str, Any]:
-        profile = self.profile_builder.read(profile_name)
+        profile = profile_document or self.profile_builder.read(profile_name)
+        if profile.get("profile_name") != profile_name:
+            raise ReferenceComparisonError("Pinned profile identity does not match.")
         metadata = metadata or self._metadata(review)
         transcript = transcript or self._transcript(metadata)
         start = self._number(review.get("render_start", metadata.get("render_start")))
@@ -111,8 +114,21 @@ class ReferenceClipComparator:
                 f"{candidate_start:.3f}–{candidate_end:.3f}s.",
                 contains_candidate=contains,
             )
+        timing_findings = self._timing_findings(
+            profile, window_words, start=start, end=end, duration=duration,
+            payoff_finding=payoff,
+        )
+        scene_finding = self._signal_count(
+            metadata.get("scene_change_timestamps"), profile, "scene_changes",
+            "pixel-change scene signals",
+        )
+        silence_finding = self._signal_count(
+            metadata.get("silence_intervals"), profile, "silence_intervals",
+            "detected silence intervals",
+        )
+        human = self._human_preferences(metadata, profile)
         report = {
-            "version": 1, "created_at": utc_now(),
+            "version": 2, "created_at": created_at or utc_now(),
             "review_id": review.get("review_id"), "video_id": review.get("video_id"),
             "profile_name": profile_name, "profile_confidence": profile["confidence"],
             "findings": {
@@ -120,6 +136,10 @@ class ReferenceClipComparator:
                 "payoff_completion": payoff, "ending_tail": tail, "layout": layout,
                 "captions": caption_finding, "candidate_containment": containment,
                 "media_format": media_format,
+                **timing_findings,
+                "scene_activity": scene_finding,
+                "silence_activity": silence_finding,
+                "human_preferences": human,
             },
             "limitations": (
                 "Findings compare measurable metadata and transcript heuristics. "
@@ -132,6 +152,124 @@ class ReferenceClipComparator:
                 raise ReferenceComparisonError("A review_id is required to write a report.")
             _atomic_json(self.report_path(profile_name, review_id), report)
         return report
+
+    def _timing_findings(
+        self, profile: dict[str, Any], words: list[dict[str, Any]], *,
+        start: float | None, end: float | None, duration: float | None,
+        payoff_finding: dict[str, Any],
+    ) -> dict[str, Any]:
+        automatic = profile.get("automatic_evidence", {})
+        if start is None or end is None or duration is None or not words:
+            unavailable = lambda label: _finding(
+                "unavailable", f"{label} is unavailable without word-level transcript timing.",
+                kind="unavailable",
+            )
+            return {
+                "speech_density": unavailable("Speech density"),
+                "spoken_pacing": unavailable("Spoken pacing"),
+                "speech_start": unavailable("Speech-start timing"),
+                "hook_timing": unavailable("Hook timing"),
+                "payoff_timing": unavailable("Payoff timing"),
+                "post_speech_tail": unavailable("Post-speech tail"),
+                "post_payoff_tail": unavailable("Post-payoff tail"),
+                "unresolved_ending": unavailable("Unresolved-ending evidence"),
+            }
+        voiced = sum(max(0.0, min(end, word["end"]) - max(start, word["start"]))
+                     for word in words)
+        spoken_span = max(word["end"] for word in words) - min(word["start"] for word in words)
+        density = voiced / duration if duration > 0 else None
+        pacing = len(words) / spoken_span if spoken_span > 0 else None
+        first = max(0.0, words[0]["start"] - start)
+        last = max(0.0, end - words[-1]["end"])
+        payoff_terms = ("because", "actually", "got it", "there it is", "that's why",
+                        "finally", "answer")
+        payoff_words = [word for index, word in enumerate(words)
+                        if any(term in " ".join(
+                            value["text"] for value in words[max(0, index - 3):index + 1]
+                        ).casefold() for term in payoff_terms)]
+        payoff_time = payoff_words[-1]["end"] - start if payoff_words else None
+        post_payoff = end - payoff_words[-1]["end"] if payoff_words else None
+        return {
+            "speech_density": self._metric_finding(density, automatic.get("speech_density"),
+                "speech density", kind="heuristic"),
+            "spoken_pacing": self._metric_finding(pacing,
+                automatic.get("words_per_spoken_second"), "words per spoken second",
+                kind="heuristic"),
+            "speech_start": self._metric_finding(first, automatic.get("speech_start"),
+                "speech-start timing", kind="known"),
+            "hook_timing": self._metric_finding(first, automatic.get("hook_timing"),
+                "likely hook timing", kind="heuristic"),
+            "payoff_timing": self._metric_finding(payoff_time,
+                automatic.get("payoff_timing"), "likely payoff timing", kind="heuristic"),
+            "post_speech_tail": self._metric_finding(last,
+                automatic.get("post_speech_tail"), "post-speech tail", kind="heuristic"),
+            "post_payoff_tail": self._metric_finding(post_payoff,
+                automatic.get("post_payoff_tail"), "post-payoff tail", kind="heuristic"),
+            "unresolved_ending": _finding(
+                "signal_present" if payoff_finding["status"] in {"unresolved", "possibly_incomplete"}
+                else "no_signal",
+                f"Transcript ending heuristic is {payoff_finding['status']}; this is not a quality judgment.",
+                kind="heuristic",
+            ),
+        }
+
+    @staticmethod
+    def _metric_finding(
+        observed: float | None, aggregate: Any, label: str, *, kind: str,
+    ) -> dict[str, Any]:
+        if observed is None:
+            return _finding("unavailable", f"Observed {label} is unavailable.", kind="unavailable")
+        reference_range = aggregate.get("range") if isinstance(aggregate, dict) else None
+        if not (isinstance(reference_range, list) and len(reference_range) == 2
+                and all(isinstance(value, (int, float)) for value in reference_range)):
+            return _finding(
+                "observed_profile_unavailable",
+                f"Observed {label} is {observed:.4f}; the pinned profile has no comparable range.",
+                kind=kind, observed=round(observed, 4), reference_range=None,
+            )
+        status = "within_observed_range" if reference_range[0] <= observed <= reference_range[1] else "different"
+        return _finding(
+            status,
+            f"Observed {label} is {observed:.4f}; the reference observed range is "
+            f"{reference_range[0]:g}–{reference_range[1]:g}. A difference is not a defect.",
+            kind=kind, observed=round(observed, 4), reference_range=reference_range,
+        )
+
+    def _signal_count(
+        self, observed: Any, profile: dict[str, Any], key: str, label: str,
+    ) -> dict[str, Any]:
+        if not isinstance(observed, list):
+            return _finding("unavailable", f"Preview {label} are unavailable.", kind="unavailable")
+        return self._metric_finding(
+            float(len(observed)), profile.get("automatic_evidence", {}).get(key),
+            label, kind="known",
+        )
+
+    @staticmethod
+    def _human_preferences(metadata: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+        observed = metadata.get("human_annotations")
+        fields = profile.get("human_preferences", {}).get("fields", {})
+        available = {
+            name: value.get("summary") for name, value in fields.items()
+            if name in {"opening_style", "clip_purpose", "pacing", "payoff_type"}
+            and isinstance(value, dict) and value.get("summary", {}).get("status") != "unavailable"
+        }
+        if not available:
+            return _finding(
+                "unavailable", "The profile has insufficient human preference contributors.",
+                kind="unavailable",
+            )
+        if not isinstance(observed, dict):
+            return _finding(
+                "profile_only", "Human preferences exist in the profile, but the preview has no "
+                "human annotations to compare. Preferences are not automatic defects.",
+                kind="human", profile_preferences=available,
+            )
+        return _finding(
+            "compared", "Preview annotations are shown beside human profile preferences; "
+            "differences remain acceptable review evidence.", kind="human",
+            observed=observed, profile_preferences=available,
+        )
 
     def compare_reviews(
         self, profile_name: str, reviews: list[dict[str, Any]], *,

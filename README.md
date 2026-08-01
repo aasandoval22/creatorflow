@@ -507,13 +507,39 @@ The same operations are available from the CLI:
 .venv/bin/python -m backend.app.reference_clips build-profile gaming_highlight
 ```
 
-Profile version 2 keeps observed automatic metrics separate from aggregated
-human preferences, reports contributor counts, and records every analysis and
-annotation revision used. Human fields require at least two annotated
-references before aggregation. A later reanalysis or annotation marks affected
-profiles stale but never rebuilds them; rebuilding remains an explicit command.
-Profiles remain descriptive soft evidence and are never applied to production
-selection, rendering, timing, captions, or publishing automatically.
+Profile version 3 records its own UTC build timestamp, category, exact input
+references, and every analysis and annotation revision used. It keeps observed
+automatic metrics separate from human preferences. Transcript-backed output
+includes spoken and media pacing, density, speech start, heuristic hook/payoff
+timing, post-payoff and post-speech tails, unresolved endings, questions, and
+reactions. Every metric reports contributors, unavailable inputs, median,
+range, and evidence type; missing evidence is never averaged as zero. Human
+fields require at least two annotated references before aggregation. A later
+reanalysis or annotation marks affected profiles stale but never rebuilds
+them; rebuilding remains an explicit command. Three-way human preference
+splits remain `mixed` instead of manufacturing a majority. Versions 1 and 2
+remain readable. Profiles remain descriptive soft evidence and are never
+applied to production selection, rendering, timing, captions, or publishing
+automatically.
+
+A protected pre-change evidence snapshot can be restored through one audited,
+transactional command rather than manual file copies:
+
+```bash
+.venv/bin/python -m backend.app.reference_clips restore-evidence \
+  --reference-id REFERENCE_ID --profile PROFILE_NAME \
+  --snapshot /protected/snapshot/path \
+  --reason "Why this exact evidence state is being restored"
+```
+
+Recovery validates protected ownership and permissions, strict-index identity,
+media and profile checksums, category, and current state. It first retains the
+displaced annotation and profile under ignored
+`data/reference_evidence_recovery/`, atomically restores only that pair, and
+appends a distinct sanitized recovery event. An absent snapshot annotation
+moves the active annotation into recovery storage. Verification or persistence
+failure rolls active evidence back, and an already-restored retry is a no-op.
+Media, index, source metadata, analysis, and other profiles are not changed.
 
 Compare rejected previews for a video:
 
@@ -527,6 +553,24 @@ writes a local report and leaves decisions, notes, timing, and previews
 unchanged. The report separates known measurements, heuristic findings, and
 unavailable evidence.
 
+For comparisons against a changing review queue, capture a stable batch first:
+
+```bash
+.venv/bin/python -m backend.app.review_comparisons capture \
+  --profile gaming_highlight
+.venv/bin/python -m backend.app.review_comparisons run --batch-id BATCH_ID
+.venv/bin/python -m backend.app.review_comparisons show --batch-id BATCH_ID
+```
+
+The ignored `data/review_comparison_batches/` manifest pins the exact pending
+review records, their statuses/timing revisions, and the profile bytes, schema
+version, build timestamp, and SHA-256 at capture. A run uses only those pinned
+inputs, notes each item's current status and whether it changed, and never
+changes decisions, notes, timing, previews, layout, captions, or publishing
+state. Completed runs are idempotent; a rebuilt profile requires a new batch.
+The review page displays the newest completed batch report with its capture
+time, pinned profile hash/version, and post-capture change indicator.
+
 One accepted reference produces a `provisional` profile because one example
 does not establish statistical confidence. Add later accepted references in
 their own directories with `reference.mp4` and `baseline.json`, register and
@@ -534,8 +578,9 @@ analyze them, then rebuild the profile to use medians and observed ranges.
 Profiles remain soft priors and never change candidate selection or rendering
 defaults automatically.
 
-Reference media, annotations, source metadata, analyses, profiles, analyzer
-temporary files, and comparison reports stay under ignored `data/` paths.
+Reference media, annotations, source metadata, analyses, profiles, recovery
+backups, analyzer temporary files, comparison batches, and reports stay under
+ignored `data/` paths.
 These commands perform no downloading, uploading, publishing, or platform
 access. The current workflow is ingestion → transcription → candidate analysis
 → preview rendering → local review → accepted-reference comparison → human

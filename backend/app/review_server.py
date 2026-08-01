@@ -39,6 +39,7 @@ from backend.services.reference_evidence_service import (
 from backend.services.reference_profile_builder import (
     ReferenceProfileBuilder, ReferenceProfileError,
 )
+from backend.services.review_comparison_batches import ReviewComparisonBatchService
 from backend.services.reference_discovery import (
     ReferenceCandidateQueue, ReferenceDiscoveryError, ReferenceDiscoveryService,
     YouTubeDataAPI,
@@ -92,6 +93,7 @@ class ReviewApplication:
     reference_candidate_queue: ReferenceCandidateQueue | None = None
     reference_discovery_service: ReferenceDiscoveryService | None = None
     reference_evidence_service: ReferenceEvidenceService | None = None
+    comparison_batches: ReviewComparisonBatchService | None = None
 
 
 class ReviewHTTPServer(ThreadingHTTPServer):
@@ -707,8 +709,15 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         comparator = self.server.app.reference_comparator
         if comparator is None:
             return {}
-        reports = {}
+        reports = (
+            self.server.app.comparison_batches.latest_reports(
+                {item["review_id"] for item in items}
+            )
+            if self.server.app.comparison_batches is not None else {}
+        )
         for item in items:
+            if item["review_id"] in reports:
+                continue
             try:
                 path = comparator.report_path(
                     self.server.app.reference_profile, item["review_id"]
@@ -1420,17 +1429,37 @@ def _comparison_section(report: dict[str, Any] | None) -> str:
     labels = (
         ("duration_fit", "Duration"), ("opening_context", "Opening context"),
         ("payoff_completion", "Payoff completion"), ("ending_tail", "Ending tail"),
-        ("layout", "Layout"),
+        ("speech_density", "Speech density"), ("spoken_pacing", "Spoken pacing"),
+        ("speech_start", "Speech start"),
+        ("hook_timing", "Hook timing"), ("payoff_timing", "Payoff timing"),
+        ("post_payoff_tail", "Post-payoff tail"),
+        ("post_speech_tail", "Post-speech tail"),
+        ("unresolved_ending", "Unresolved ending"),
+        ("scene_activity", "Scene-change signals"),
+        ("silence_activity", "Silence signals"),
+        ("media_format", "Resolution and frame rate"), ("layout", "Layout"),
+        ("captions", "Captions"), ("human_preferences", "Human preferences"),
     )
     rows = "".join(
         f"<li><strong>{_e(label)}:</strong> {_e(findings.get(key, {}).get('status'))}"
         f" — {_e(findings.get(key, {}).get('evidence'))}</li>"
         for key, label in labels
     )
+    batch = report.get("batch") if isinstance(report.get("batch"), dict) else None
+    batch_html = ""
+    if batch:
+        batch_html = (
+            f"<p><strong>Batch:</strong> {_e(batch.get('batch_id'))}<br>"
+            f"<strong>Captured:</strong> {_e(batch.get('captured_at'))}<br>"
+            f"<strong>Profile version/hash:</strong> {_e(batch.get('profile_version'))} / "
+            f"{_e(batch.get('profile_sha256'))}<br>"
+            f"<strong>Status/revision changed since capture:</strong> "
+            f"{'Yes' if batch.get('status_or_revision_changed') else 'No'}</p>"
+        )
     return (
         "<section><h4>Reference comparison</h4>"
         f"<p><strong>Reference profile:</strong> {_e(report.get('profile_name'))}<br>"
-        f"<strong>Profile confidence:</strong> {_e(report.get('profile_confidence'))}</p>"
+        f"<strong>Profile confidence:</strong> {_e(report.get('profile_confidence'))}</p>{batch_html}"
         f"<ul>{rows}</ul></section>"
     )
 
@@ -1495,10 +1524,12 @@ def create_application(args: argparse.Namespace) -> ReviewApplication:
         annotations=annotation_store,
         profile_builder=profile_builder,
     )
+    batches = ReviewComparisonBatchService(queue, profile_builder, comparator)
     return ReviewApplication(
         queue, service, secrets.token_urlsafe(32), args.maximum_render_duration,
         comparator, args.reference_profile, candidate_queue, discovery_service,
         evidence_service,
+        batches,
     )
 
 
