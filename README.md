@@ -79,6 +79,11 @@ manifest, faster-whisper transcription, deterministic candidate analysis,
 reaction-context preview renderer, and review queue. The current defaults
 inspect three recent videos per enabled creator and render the top three
 candidates. Use `--max-videos` and `--top` to set explicit per-run limits.
+An enabled channel may set a stricter positive `max_videos_per_cycle` in
+`backend/config/channels.json`. The runner inspects only that many newest
+uploads for the channel, so a value of `1` skips older backlog when the newest
+upload is already processed. The run-wide `--max-videos` value remains an
+upper bound, and durable video-ID deduplication still applies.
 
 Durable orchestration state is stored at
 `data/production/processing_state.json`. Version 1 contains an `updated_at`

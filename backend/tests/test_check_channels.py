@@ -161,6 +161,27 @@ def test_valid_max_videos_is_forwarded():
     )
 
 
+def test_per_channel_max_videos_is_stricter_than_cli_limit():
+    result = DownloadResult(DownloadStatus.SUCCESS, "caseoh", "downloaded")
+    limited = [{
+        "name": "CaseOh",
+        "youtube_url": "https://www.youtube.com/@caseoh_",
+        "enabled": True,
+        "max_videos_per_cycle": 1,
+    }]
+
+    exit_code, downloader = run_checker(
+        limited, [result], ("--max-videos", "7")
+    )
+
+    assert exit_code == 0
+    downloader.download_recent_channel_videos.assert_called_once_with(
+        channel_name="CaseOh",
+        channel_url="https://www.youtube.com/@caseoh_",
+        max_videos=1,
+    )
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "three", "1.5"])
 def test_invalid_max_videos_produces_argparse_error(value, capsys):
     with pytest.raises(SystemExit) as error:

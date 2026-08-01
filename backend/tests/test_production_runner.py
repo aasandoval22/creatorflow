@@ -226,6 +226,103 @@ def test_dry_run_discovers_and_plans_without_writes(tmp_path):
     assert '"event": "video_planned"' in output.getvalue()
 
 
+def test_per_channel_limit_processes_only_newest_discovered_video(tmp_path):
+    runner, dependencies, state, output = setup_runner(
+        tmp_path,
+        entries={"CaseOh": [metadata("case-newest"), metadata("case-older")]},
+    )
+    caseoh = {
+        "name": "CaseOh",
+        "youtube_url": "https://www.youtube.com/@caseoh_",
+        "max_videos_per_cycle": 1,
+    }
+    runner.dependencies.channel_manager = SimpleNamespace(
+        get_enabled_channels=lambda: [caseoh]
+    )
+
+    summary = runner.run()
+
+    assert summary.new_videos_discovered == 1
+    assert summary.videos_processed == 1
+    assert dependencies.discovery.calls == [
+        ("CaseOh", "https://www.youtube.com/@caseoh_", 1)
+    ]
+    assert dependencies.downloader.calls == ["case-newest"]
+    assert set(state.load()["videos"]) == {"case-newest"}
+    assert "case-older" not in output.getvalue()
+
+
+def test_caseoh_backlog_is_not_scanned_when_newest_is_already_processed(tmp_path):
+    runner, dependencies, state, output = setup_runner(
+        tmp_path,
+        entries={"CaseOh": [metadata("case-newest"), metadata("case-historical")]},
+        dry_run=True,
+    )
+    runner.dependencies.channel_manager = SimpleNamespace(
+        get_enabled_channels=lambda: [{
+            "name": "CaseOh",
+            "youtube_url": "https://www.youtube.com/@caseoh_",
+            "max_videos_per_cycle": 1,
+        }]
+    )
+    document = state.empty()
+    state.begin(document, "case-newest", "CaseOh")
+    state.update(document, "case-newest", stage="review_ready", status="completed")
+    original_state = state.path.read_bytes()
+
+    summary = runner.run()
+
+    assert summary.videos_skipped == 1
+    assert summary.new_videos_discovered == 0
+    assert summary.videos_processed == 0
+    assert dependencies.discovery.calls == [
+        ("CaseOh", "https://www.youtube.com/@caseoh_", 1)
+    ]
+    assert not dependencies.downloader.calls
+    assert "case-historical" not in output.getvalue()
+    assert state.path.read_bytes() == original_state
+
+
+def test_dry_run_checks_only_two_configured_enabled_creators(tmp_path):
+    runner, dependencies, state, output = setup_runner(
+        tmp_path,
+        entries={
+            "Jynxzi": [metadata("jynxzi-new")],
+            "CaseOh": [metadata("case-new"), metadata("case-old")],
+        },
+        dry_run=True,
+    )
+    runner.dependencies.channel_manager = SimpleNamespace(
+        get_enabled_channels=lambda: [
+            {
+                "name": "Jynxzi",
+                "youtube_url": "https://www.youtube.com/@Jynxzi",
+                "enabled": True,
+            },
+            {
+                "name": "CaseOh",
+                "youtube_url": "https://www.youtube.com/@caseoh_",
+                "enabled": True,
+                "max_videos_per_cycle": 1,
+            },
+        ]
+    )
+
+    summary = runner.run()
+
+    assert summary.creators_checked == 2
+    assert summary.new_videos_discovered == 2
+    assert dependencies.discovery.calls == [
+        ("Jynxzi", "https://www.youtube.com/@Jynxzi", 3),
+        ("CaseOh", "https://www.youtube.com/@caseoh_", 1),
+    ]
+    assert not state.path.exists()
+    assert not dependencies.downloader.calls
+    assert not dependencies.transcriber.calls
+    assert not dependencies.renderer.calls
+    assert "case-old" not in output.getvalue()
+
+
 def test_dry_run_read_only_review_deduplication(tmp_path):
     queue = tmp_path / "reviews.json"
     queue.write_text(json.dumps({

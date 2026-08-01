@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from backend.services.channel_manager import ChannelManager
+from backend.services.channel_manager import (
+    CONFIG_FILE,
+    ChannelManager,
+    channel_video_limit,
+    normalize_youtube_channel_url,
+)
 
 
 def write_config(path, value):
@@ -23,6 +28,47 @@ def test_loads_valid_channels_and_filters_enabled(tmp_path):
 
     assert len(manager.load_channels()) == 2
     assert manager.get_enabled_channels() == [channel()]
+
+
+def test_repository_configuration_enables_only_jynxzi_and_caseoh():
+    channels = ChannelManager(CONFIG_FILE).load_channels()
+    enabled = [item for item in channels if item["enabled"]]
+    disabled = [item["name"] for item in channels if not item["enabled"]]
+
+    assert [item["name"] for item in enabled] == ["Jynxzi", "CaseOh"]
+    assert enabled[1] == {
+        "name": "CaseOh",
+        "enabled": True,
+        "youtube_url": "https://www.youtube.com/@caseoh_",
+        "max_videos_per_cycle": 1,
+    }
+    assert disabled == [
+        "ZkMushroom",
+        "Datto",
+        "Aztecross",
+        "tarik",
+        "Kai Cenat Live",
+        "SypherPK",
+        "xQc",
+    ]
+    assert normalize_youtube_channel_url(enabled[1]["youtube_url"]) == (
+        "https://www.youtube.com/@caseoh_"
+    )
+
+
+def test_channel_video_limit_uses_stricter_channel_or_run_limit():
+    assert channel_video_limit(channel(), 3) == 3
+    assert channel_video_limit({**channel(), "max_videos_per_cycle": 1}, 3) == 1
+    assert channel_video_limit({**channel(), "max_videos_per_cycle": 5}, 2) == 2
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "1", None])
+def test_rejects_invalid_per_channel_video_limit(tmp_path, value):
+    entry = {**channel(), "max_videos_per_cycle": value}
+    config = write_config(tmp_path / "channels.json", {"channels": [entry]})
+
+    with pytest.raises(ValueError, match="must be a positive int"):
+        ChannelManager(config).load_channels()
 
 
 @pytest.mark.parametrize("value", [[], "channels", 42, None])

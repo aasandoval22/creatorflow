@@ -6,6 +6,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_FILE = PROJECT_ROOT / "backend" / "config" / "channels.json"
+CHANNEL_VIDEO_LIMIT_FIELD = "max_videos_per_cycle"
 
 
 def normalize_youtube_channel_url(channel_url: str) -> str:
@@ -162,6 +163,18 @@ class ChannelManager:
                 f"Channel entry {index} has an empty name."
             )
 
+        if CHANNEL_VIDEO_LIMIT_FIELD in channel:
+            limit = channel[CHANNEL_VIDEO_LIMIT_FIELD]
+            if (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or limit < 1
+            ):
+                raise ValueError(
+                    f"Channel entry {index} field "
+                    f"'{CHANNEL_VIDEO_LIMIT_FIELD}' must be a positive int."
+                )
+
         try:
             return normalize_youtube_channel_url(channel["youtube_url"])
         except ValueError as error:
@@ -169,6 +182,28 @@ class ChannelManager:
                 f"Channel entry {index} field 'youtube_url' is invalid: "
                 f"{error}."
             ) from error
+
+
+def channel_video_limit(channel: dict[str, Any], run_limit: int) -> int:
+    """Return the stricter run-wide or optional per-channel discovery limit."""
+
+    if (
+        isinstance(run_limit, bool)
+        or not isinstance(run_limit, int)
+        or run_limit < 1
+    ):
+        raise ValueError("run video limit must be a positive integer")
+    configured = channel.get(CHANNEL_VIDEO_LIMIT_FIELD, run_limit)
+    if (
+        isinstance(configured, bool)
+        or not isinstance(configured, int)
+        or configured < 1
+    ):
+        raise ValueError(
+            f"channel field {CHANNEL_VIDEO_LIMIT_FIELD!r} must be a "
+            "positive integer"
+        )
+    return min(run_limit, configured)
 
 
 def main() -> None:
