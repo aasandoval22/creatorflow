@@ -291,7 +291,8 @@ def test_profile_separates_evidence_counts_and_staleness(tmp_path):
     profile = service.rebuild_profile(
         "gaming_highlight", request_id="profile-one"
     )
-    assert profile["version"] == 2 and profile["staleness"]["status"] == "current"
+    assert profile["version"] == 3 and profile["staleness"]["status"] == "current"
+    assert profile["built_at"] and profile["category"] == "gaming_highlight"
     assert profile["automatic_evidence"]["duration"]["contributor_count"] == 3
     composition = profile["human_preferences"]["fields"]["composition"]
     assert composition["contributor_count"] == 2
@@ -322,6 +323,69 @@ def test_profile_separates_evidence_counts_and_staleness(tmp_path):
         entry["reference_id"] for entry in entries
     )
     assert audit.history(profile_name="gaming_highlight")[-2]["action"] == "profile_rebuild"
+
+
+def test_profile_v3_complete_timing_aggregates_missing_and_mixed_preferences(tmp_path):
+    _, entries, _, _, builder, service = environment(tmp_path)
+    openings = ("immediate_action", "spoken_hook", "mid_action_opening")
+    for index, entry in enumerate(entries):
+        service.update_annotations(
+            entry["reference_id"], expected_revision=0,
+            values=annotation_values(
+                opening_style=openings[index], payoff_type=(
+                    "gameplay_result", "reaction", "punchline"
+                )[index], pacing="fast",
+            ), request_id=f"timing-annotation-{index}",
+        )
+        service.reanalyze(
+            entry["reference_id"], transcription=True, force=True,
+            request_id=f"timing-analysis-{index}",
+        )
+    # One unavailable hook must be excluded, not converted to zero.
+    analysis_path = Path(entries[2]["analysis_path"])
+    analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    analysis["speech"]["likely_hook"]["timestamp"] = None
+    analysis_path.write_text(json.dumps(analysis), encoding="utf-8")
+    unrelated = builder.output_directory / "personality_reaction.json"
+    unrelated.parent.mkdir(parents=True, exist_ok=True)
+    unrelated.write_bytes(b'{"fixture":"unchanged"}\n')
+    profile = builder.build("gaming_highlight")
+    assert profile["version"] == 3 and profile["built_at"]
+    assert profile["category"] == "gaming_highlight"
+    automatic = profile["automatic_evidence"]
+    for name in (
+        "words_per_spoken_second", "words_per_media_second", "speech_density",
+        "speech_start", "hook_timing", "payoff_timing", "post_payoff_tail",
+        "post_speech_tail", "unresolved_ending", "question_count", "reaction_count",
+    ):
+        assert {"contributor_count", "unavailable_count", "median", "range",
+                "evidence_type"} <= set(automatic[name])
+    assert automatic["hook_timing"]["contributor_count"] == 2
+    assert automatic["hook_timing"]["unavailable_count"] == 1
+    assert automatic["hook_timing"]["range"] == [0.4, 0.4]
+    assert automatic["payoff_timing"]["median"] == 40.6
+    assert automatic["post_payoff_tail"]["median"] == 4.4
+    assert automatic["post_speech_tail"]["median"] == 4.4
+    fields = profile["human_preferences"]["fields"]
+    assert fields["opening_style"]["summary"]["status"] == "mixed"
+    assert fields["payoff_type"]["summary"]["status"] == "mixed"
+    assert unrelated.read_bytes() == b'{"fixture":"unchanged"}\n'
+
+
+def test_profile_loading_remains_backward_compatible(tmp_path):
+    _, _, _, _, builder, _ = environment(tmp_path, count=1)
+    current = builder.build("gaming_highlight")
+    path = builder.profile_path("gaming_highlight")
+    version_two = dict(current)
+    version_two["version"] = 2
+    version_two.pop("built_at")
+    version_two.pop("category")
+    path.write_text(json.dumps(version_two), encoding="utf-8")
+    assert builder.read("gaming_highlight")["version"] == 2
+    path.write_text(json.dumps({
+        "version": 1, "profile_name": "gaming_highlight", "reference_ids": []
+    }), encoding="utf-8")
+    assert builder.read("gaming_highlight")["version"] == 1
 
 
 def test_audit_append_failure_rolls_back_annotations_analysis_and_profiles(tmp_path):

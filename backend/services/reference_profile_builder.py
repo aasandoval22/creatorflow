@@ -6,6 +6,7 @@ import json
 import statistics
 from collections import Counter
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from backend.services.reference_clip_library import (
     PROJECT_ROOT, ReferenceClipError, ReferenceClipLibrary, _atomic_json,
     load_and_validate_baseline,
 )
+from backend.services.video_manifest import utc_now
 
 DEFAULT_PROFILE_ROOT = PROJECT_ROOT / "data" / "reference_profiles"
 
@@ -95,7 +97,8 @@ class ReferenceProfileBuilder:
         automatic_evidence = self._automatic_evidence(analyses, durations)
         human_preferences = self._human_preferences(ids)
         document = {
-            "version": 2, "profile_name": profile_name, "reference_ids": ids,
+            "version": 3, "profile_name": profile_name, "category": profile_name,
+            "built_at": utc_now(), "reference_ids": ids,
             "reference_count": len(ids),
             "confidence": "provisional" if len(ids) == 1 else "multi_reference",
             "duration": {
@@ -149,7 +152,21 @@ class ReferenceProfileBuilder:
                 "Human review determines whether a clip is publishable.",
             ],
         }
-        _atomic_json(self.profile_path(profile_name), document)
+        # Identical rebuilds keep their intrinsic timestamp. This makes retries
+        # deterministic while a real input revision produces a new build time.
+        path = self.profile_path(profile_name)
+        if path.is_file():
+            try:
+                prior = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                prior = None
+            if isinstance(prior, dict) and prior.get("version") == 3:
+                left, right = deepcopy(prior), deepcopy(document)
+                left.pop("built_at", None)
+                right.pop("built_at", None)
+                if left == right:
+                    document["built_at"] = prior["built_at"]
+        _atomic_json(path, document)
         return document
 
     def read(self, profile_name: str) -> dict[str, Any]:
@@ -161,12 +178,29 @@ class ReferenceProfileBuilder:
         except (OSError, json.JSONDecodeError) as error:
             raise ReferenceProfileError(f"Cannot read profile {path}: {error}.") from error
         if (
-            not isinstance(document, dict) or document.get("version") not in {1, 2}
+            not isinstance(document, dict) or document.get("version") not in {1, 2, 3}
             or document.get("profile_name") != profile_name
         ):
             raise ReferenceProfileError(f"Profile {path} is malformed.")
         if document["version"] == 1:
             return document
+        if document["version"] == 3:
+            reference_ids = document.get("reference_ids")
+            if (
+                not isinstance(document.get("built_at"), str)
+                or document.get("category") != profile_name
+                or not isinstance(reference_ids, list)
+                or not all(isinstance(value, str) for value in reference_ids)
+                or len(reference_ids) != len(set(reference_ids))
+                or reference_ids != sorted(reference_ids)
+            ):
+                raise ReferenceProfileError(f"Profile {path} has malformed version 3 identity.")
+            try:
+                built_at = datetime.fromisoformat(document["built_at"].replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ReferenceProfileError(f"Profile {path} has an invalid build timestamp.") from error
+            if built_at.tzinfo is None:
+                raise ReferenceProfileError(f"Profile {path} build timestamp has no timezone.")
         return self._with_staleness(document)
 
     def mark_stale(
@@ -222,58 +256,81 @@ class ReferenceProfileBuilder:
             for item in analyses
             if item.get("media", {}).get("frame_rate") is not None
         ]
-        scene_counts = [
-            len(item.get("visual_timing", {}).get("scene_change_timestamps", []))
-            for item in analyses
-        ]
-        silence_counts = [
-            len(item.get("audio_timing", {}).get("silence_intervals", []))
-            for item in analyses
-        ]
+        scene_counts = [len(value) for item in analyses
+                        if isinstance((value := item.get("visual_timing", {}).get(
+                            "scene_change_timestamps")), list)]
+        silence_counts = [len(value) for item in analyses
+                          if isinstance((value := item.get("audio_timing", {}).get(
+                              "silence_intervals")), list)]
         transcript_analyses = [
             item for item in analyses
             if item.get("transcription", {}).get("status") == "available"
             or bool(item.get("speech", {}).get("words"))
         ]
-        word_counts = [
-            int(item.get("speech", {}).get("word_count", 0))
-            for item in transcript_analyses
-        ]
-        speech_densities = [
-            float(item.get("speech", {}).get("speech_density", 0))
-            for item in transcript_analyses
-            if item.get("speech", {}).get("speech_density") is not None
-        ]
+        def values(path: tuple[str, ...], sources: list[dict[str, Any]]) -> list[float]:
+            result: list[float] = []
+            for source in sources:
+                current: Any = source
+                for name in path:
+                    current = current.get(name) if isinstance(current, dict) else None
+                if isinstance(current, (int, float)) and not isinstance(current, bool):
+                    result.append(float(current))
+            return result
+
+        def metric(
+            observed: list[float], *, total: int, evidence_type: str,
+            evidence_kind: str, count_alias: bool = False,
+        ) -> dict[str, Any]:
+            document = {
+                "evidence_type": evidence_type if observed else "unavailable",
+                "evidence_kind": evidence_kind if observed else "unavailable",
+                "contributor_count": len(observed),
+                "unavailable_count": total - len(observed),
+                "median": round(statistics.median(observed), 4) if observed else None,
+                "range": [round(min(observed), 4), round(max(observed), 4)] if observed else None,
+            }
+            if count_alias:
+                document["median_count"] = document["median"]
+            return document
+
+        word_counts = values(("speech", "word_count"), transcript_analyses)
+        speech_densities = values(("speech", "speech_density"), transcript_analyses)
+        media_rates = values(("speech", "words_per_second"), transcript_analyses)
+        spoken_rates = values(("speech", "words_per_spoken_second"), transcript_analyses)
+        speech_starts = values(("speech", "first_word_start"), transcript_analyses)
+        hook_times = [float(item["speech"]["likely_hook"]["timestamp"])
+                      for item in transcript_analyses
+                      if item.get("speech", {}).get("likely_hook", {}).get("status") == "heuristic_signal"
+                      and isinstance(item["speech"]["likely_hook"].get("timestamp"), (int, float))]
+        payoff_times = values(("speech", "likely_payoff", "timestamp"), transcript_analyses)
+        post_payoff = values(("speech", "post_payoff_tail"), transcript_analyses)
+        post_speech = values(("speech", "post_speech_tail"), transcript_analyses)
+        question_counts = [float(len(item.get("speech", {}).get("questions", [])))
+                           for item in transcript_analyses
+                           if isinstance(item.get("speech", {}).get("questions"), list)]
+        reaction_counts = [float(len(item.get("speech", {}).get("reaction_signals", [])))
+                           for item in transcript_analyses
+                           if isinstance(item.get("speech", {}).get("reaction_signals"), list)]
+        unresolved = [float(bool(item.get("speech", {}).get(
+            "unresolved_ending_indicators"))) for item in transcript_analyses
+            if isinstance(item.get("speech", {}).get("unresolved_ending_indicators"), list)]
+        total = len(analyses)
         return {
-            "duration": {
-                "evidence_kind": "observed_metric",
-                "contributor_count": len(durations),
-                "median": round(statistics.median(durations), 3),
-                "range": [round(min(durations), 3), round(max(durations), 3)],
-            },
-            "frame_rate": {
-                "evidence_kind": "observed_metric",
-                "contributor_count": len(frame_rates),
-                "median": round(statistics.median(frame_rates), 3) if frame_rates else None,
-            },
-            "scene_changes": {
-                "evidence_kind": "pixel_change_signal",
-                "contributor_count": len(scene_counts),
-                "median_count": round(statistics.median(scene_counts), 3),
-                "range": [min(scene_counts), max(scene_counts)],
-            },
-            "silence_intervals": {
-                "evidence_kind": "audio_timing_signal",
-                "contributor_count": len(silence_counts),
-                "median_count": round(statistics.median(silence_counts), 3),
-                "range": [min(silence_counts), max(silence_counts)],
-            },
+            "duration": metric(durations, total=total, evidence_type="observed",
+                               evidence_kind="observed_metric"),
+            "frame_rate": metric(frame_rates, total=total, evidence_type="observed",
+                                 evidence_kind="observed_metric"),
+            "scene_changes": metric(scene_counts, total=total, evidence_type="observed",
+                                    evidence_kind="pixel_change_signal", count_alias=True),
+            "silence_intervals": metric(silence_counts, total=total, evidence_type="observed",
+                                        evidence_kind="audio_timing_signal", count_alias=True),
             "speech": {
+                "evidence_type": "heuristic" if transcript_analyses else "unavailable",
                 "evidence_kind": (
                     "transcript_heuristic" if transcript_analyses else "unavailable"
                 ),
                 "contributor_count": len(transcript_analyses),
-                "unavailable_count": len(analyses) - len(transcript_analyses),
+                "unavailable_count": total - len(transcript_analyses),
                 "median_word_count": (
                     round(statistics.median(word_counts), 3) if word_counts else None
                 ),
@@ -281,7 +338,33 @@ class ReferenceProfileBuilder:
                     round(statistics.median(speech_densities), 4)
                     if speech_densities else None
                 ),
+                "median": round(statistics.median(speech_densities), 4)
+                if speech_densities else None,
+                "range": [round(min(speech_densities), 4), round(max(speech_densities), 4)]
+                if speech_densities else None,
             },
+            "words_per_spoken_second": metric(spoken_rates, total=total,
+                evidence_type="heuristic", evidence_kind="transcript_heuristic"),
+            "words_per_media_second": metric(media_rates, total=total,
+                evidence_type="observed", evidence_kind="transcript_timing"),
+            "speech_density": metric(speech_densities, total=total,
+                evidence_type="observed", evidence_kind="transcript_timing"),
+            "speech_start": metric(speech_starts, total=total,
+                evidence_type="observed", evidence_kind="transcript_timing"),
+            "hook_timing": metric(hook_times, total=total,
+                evidence_type="heuristic", evidence_kind="transcript_heuristic"),
+            "payoff_timing": metric(payoff_times, total=total,
+                evidence_type="heuristic", evidence_kind="transcript_heuristic"),
+            "post_payoff_tail": metric(post_payoff, total=total,
+                evidence_type="heuristic", evidence_kind="transcript_heuristic"),
+            "post_speech_tail": metric(post_speech, total=total,
+                evidence_type="observed", evidence_kind="transcript_timing"),
+            "unresolved_ending": metric(unresolved, total=total,
+                evidence_type="heuristic", evidence_kind="transcript_heuristic"),
+            "question_count": metric(question_counts, total=total,
+                evidence_type="heuristic", evidence_kind="transcript_heuristic", count_alias=True),
+            "reaction_count": metric(reaction_counts, total=total,
+                evidence_type="heuristic", evidence_kind="transcript_heuristic", count_alias=True),
         }
 
     def _human_preferences(self, reference_ids: list[str]) -> dict[str, Any]:
@@ -296,25 +379,30 @@ class ReferenceProfileBuilder:
             values = [item[name] for item in annotations if item[name] != "unknown"]
             contributors = len(values)
             fields[name] = {
+                "evidence_type": "human" if contributors >= minimum else "unavailable",
                 "evidence_kind": (
                     "human_preference" if contributors >= minimum else "unavailable"
                 ),
                 "contributor_count": contributors,
+                "unavailable_count": len(reference_ids) - contributors,
                 "minimum_contributors": minimum,
                 "value_counts": (
                     dict(sorted(Counter(values).items()))
                     if contributors >= minimum else {}
                 ),
+                "summary": self._preference_summary(values, minimum),
             }
         for name in LIST_FIELDS:
             lists = [item[name] for item in annotations if item[name]]
             counts = Counter(value for values in lists for value in values)
             contributors = len(lists)
             fields[name] = {
+                "evidence_type": "human" if contributors >= minimum else "unavailable",
                 "evidence_kind": (
                     "human_preference" if contributors >= minimum else "unavailable"
                 ),
                 "contributor_count": contributors,
+                "unavailable_count": len(reference_ids) - contributors,
                 "minimum_contributors": minimum,
                 "shared_values": (
                     [
@@ -336,6 +424,17 @@ class ReferenceProfileBuilder:
             "minimum_contributors": minimum,
             "fields": fields,
         }
+
+    @staticmethod
+    def _preference_summary(values: list[str], minimum: int) -> dict[str, Any]:
+        if len(values) < minimum:
+            return {"status": "unavailable", "values": []}
+        counts = Counter(values)
+        highest = max(counts.values())
+        winners = sorted(value for value, count in counts.items() if count == highest)
+        if len(winners) == 1 and highest > len(values) / 2:
+            return {"status": "common", "values": winners}
+        return {"status": "mixed", "values": sorted(counts)}
 
     def _with_staleness(self, document: dict[str, Any]) -> dict[str, Any]:
         result = deepcopy(document)

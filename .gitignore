@@ -38,6 +38,8 @@ data/reference_clips/
 data/reference_profiles/
 data/reference_annotations/
 data/reference_comparisons/
+data/reference_evidence_recovery/
+data/review_comparison_batches/
 data/reference_discovery/
 data/reference_discovery/decision_events.jsonl
 data/reference_discovery/withdrawal_recovery/

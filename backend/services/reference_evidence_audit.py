@@ -14,16 +14,22 @@ from backend.services.reference_decision_audit import configured_reviewer_name
 from backend.services.video_manifest import utc_now
 
 
-AUDIT_VERSION = 1
-ACTIONS = frozenset({"annotation_update", "reanalyze", "profile_rebuild"})
+AUDIT_VERSION = 2
+ACTIONS = frozenset({
+    "annotation_update", "reanalyze", "profile_rebuild", "evidence_recovery",
+})
 RESULTS = frozenset({"success", "failure"})
 SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
-FIELDS = {
+LEGACY_FIELDS = {
     "version", "event_id", "timestamp", "action", "reference_id",
     "profile_name", "reference_ids", "previous_annotation_revision",
     "new_annotation_revision", "previous_analysis_revision",
     "new_analysis_revision", "changed_fields", "reviewer", "result",
     "failure_reason", "request_id",
+}
+FIELDS = LEGACY_FIELDS | {
+    "snapshot_id", "recovery_id", "resulting_annotation_state",
+    "previous_profile_sha256", "new_profile_sha256", "reason",
 }
 
 
@@ -31,7 +37,9 @@ class ReferenceEvidenceAuditError(RuntimeError):
     """The evidence audit ledger is malformed or cannot be persisted."""
 
 
-def _safe_text(value: str | None, *, maximum: int = 500) -> str | None:
+def safe_evidence_audit_text(
+    value: str | None, *, maximum: int = 500
+) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
@@ -159,6 +167,12 @@ class ReferenceEvidenceAuditLedger:
         reviewer: str | None = None,
         failure_reason: str | None = None,
         request_id: str | None = None,
+        snapshot_id: str | None = None,
+        recovery_id: str | None = None,
+        resulting_annotation_state: str | None = None,
+        previous_profile_sha256: str | None = None,
+        new_profile_sha256: str | None = None,
+        reason: str | None = None,
     ) -> dict[str, Any]:
         return {
             "version": AUDIT_VERSION,
@@ -175,17 +189,32 @@ class ReferenceEvidenceAuditLedger:
             "changed_fields": sorted(changed_fields or []),
             "reviewer": configured_reviewer_name(reviewer),
             "result": result,
-            "failure_reason": _safe_text(failure_reason),
+            "failure_reason": safe_evidence_audit_text(failure_reason),
             "request_id": request_id,
+            "snapshot_id": snapshot_id,
+            "recovery_id": recovery_id,
+            "resulting_annotation_state": resulting_annotation_state,
+            "previous_profile_sha256": previous_profile_sha256,
+            "new_profile_sha256": new_profile_sha256,
+            "reason": safe_evidence_audit_text(reason),
         }
 
     @staticmethod
     def _validate(event: Any) -> None:
-        if not isinstance(event, dict) or set(event) != FIELDS:
+        if not isinstance(event, dict) or event.get("version") not in {1, 2}:
+            raise ReferenceEvidenceAuditError(
+                "Evidence audit event has an unsupported version."
+            )
+        expected_fields = LEGACY_FIELDS if event["version"] == 1 else FIELDS
+        if set(event) != expected_fields:
             raise ReferenceEvidenceAuditError(
                 "Evidence audit event has missing or unknown fields."
             )
-        if event["version"] != AUDIT_VERSION or event["action"] not in ACTIONS:
+        allowed_actions = (
+            ACTIONS - {"evidence_recovery"}
+            if event["version"] == 1 else ACTIONS
+        )
+        if event["action"] not in allowed_actions:
             raise ReferenceEvidenceAuditError("Evidence audit event has invalid version or action.")
         if event["result"] not in RESULTS:
             raise ReferenceEvidenceAuditError("Evidence audit event has invalid result.")
@@ -225,6 +254,31 @@ class ReferenceEvidenceAuditLedger:
         for name in ("reviewer", "failure_reason"):
             if event[name] is not None and not isinstance(event[name], str):
                 raise ReferenceEvidenceAuditError(f"Evidence audit {name} is invalid.")
+        if event["version"] == 2:
+            for name in ("snapshot_id", "recovery_id"):
+                value = event[name]
+                if value is not None and (
+                    not isinstance(value, str) or not SAFE_ID.fullmatch(value)
+                ):
+                    raise ReferenceEvidenceAuditError(
+                        f"Evidence audit {name} is invalid."
+                    )
+            state = event["resulting_annotation_state"]
+            if state not in {None, "present", "absent"}:
+                raise ReferenceEvidenceAuditError(
+                    "Evidence audit resulting annotation state is invalid."
+                )
+            for name in ("previous_profile_sha256", "new_profile_sha256"):
+                value = event[name]
+                if value is not None and (
+                    not isinstance(value, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", value)
+                ):
+                    raise ReferenceEvidenceAuditError(
+                        f"Evidence audit {name} is invalid."
+                    )
+            if event["reason"] is not None and not isinstance(event["reason"], str):
+                raise ReferenceEvidenceAuditError("Evidence audit reason is invalid.")
         forbidden = " ".join(event).casefold()
         if any(value in forbidden for value in (
             "token", "api_key", "cookie", "authorization", "environment"

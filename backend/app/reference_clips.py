@@ -28,6 +28,10 @@ from backend.services.reference_evidence_audit import (
 from backend.services.reference_evidence_service import (
     ReferenceEvidenceError, ReferenceEvidenceService,
 )
+from backend.services.reference_evidence_recovery import (
+    DEFAULT_RECOVERY_ROOT, ReferenceEvidenceRecoveryError,
+    ReferenceEvidenceRecoveryService,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--annotation-directory", type=Path, default=DEFAULT_ANNOTATION_ROOT
     )
     parser.add_argument("--evidence-audit-path", type=Path)
+    parser.add_argument("--recovery-directory", type=Path, default=DEFAULT_RECOVERY_ROOT)
     sub = parser.add_subparsers(dest="command", required=True)
     register = sub.add_parser("register")
     register.add_argument("--reference-directory", type=Path)
@@ -89,6 +94,13 @@ def build_parser() -> argparse.ArgumentParser:
     history = sub.add_parser("evidence-history")
     history.add_argument("reference_id")
     history.add_argument("--limit", type=int)
+    restore = sub.add_parser(
+        "restore-evidence", help="Restore one annotation/profile pair from a protected snapshot."
+    )
+    restore.add_argument("--reference-id", required=True)
+    restore.add_argument("--profile", required=True)
+    restore.add_argument("--snapshot", type=Path, required=True)
+    restore.add_argument("--reason", required=True)
     return parser
 
 
@@ -229,6 +241,19 @@ def main(argv: Sequence[str] | None = ()) -> int:
             )
             print(json.dumps(events, indent=2, sort_keys=True))
             print(f"{len(events)} evidence event(s).")
+        elif args.command == "restore-evidence":
+            result = ReferenceEvidenceRecoveryService(
+                evidence, recovery_root=args.recovery_directory
+            ).restore(
+                args.reference_id, args.profile, args.snapshot,
+                reason=args.reason, request_id=uuid.uuid4().hex,
+            )
+            print(f"Recovery status: {result['status']}")
+            print(f"Reference: {result['reference_id']}")
+            print(f"Profile SHA-256: {result['profile_sha256']}")
+            print(f"Annotation state: {result['annotation_state']}")
+            if result["recovery_path"]:
+                print(f"Protected prior-state backup: {result['recovery_path']}")
         return 0
     except (
         ReferenceAnnotationError,
@@ -236,6 +261,7 @@ def main(argv: Sequence[str] | None = ()) -> int:
         ReferenceAnalysisError,
         ReferenceEvidenceAuditError,
         ReferenceEvidenceError,
+        ReferenceEvidenceRecoveryError,
         ReferenceProfileError,
         OSError,
         ValueError,
