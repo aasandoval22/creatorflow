@@ -22,8 +22,9 @@
     },
     {
       "name": "CaseOh",
-      "enabled": false,
-      "youtube_url": "https://www.youtube.com/@caseoh_"
+      "enabled": true,
+      "youtube_url": "https://www.youtube.com/@caseoh_",
+      "max_videos_per_cycle": 1
     },
     {
       "name": "tarik",

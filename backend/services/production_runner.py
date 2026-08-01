@@ -21,7 +21,11 @@ except ImportError:  # pragma: no cover - production host is Linux
 
 from backend.app.analyze_clips import positive_integer
 from backend.services.batch_preview_renderer import BatchPreviewRenderer
-from backend.services.channel_manager import CONFIG_FILE, ChannelManager
+from backend.services.channel_manager import (
+    CONFIG_FILE,
+    ChannelManager,
+    channel_video_limit,
+)
 from backend.services.clip_candidate_generator import (
     DEFAULT_CANDIDATE_DIRECTORY, AnalysisResultStatus, ClipCandidateGenerator,
 )
@@ -332,8 +336,9 @@ class ProductionRunner:
     ) -> None:
         name, url = channel["name"], channel["youtube_url"]
         try:
+            maximum = channel_video_limit(channel, self.max_videos)
             discovery = self.dependencies.discovery.discover_recent_channel_metadata(
-                name, url, self.max_videos
+                name, url, maximum
             )
             if discovery.status is DownloadStatus.FAILED:
                 raise ProductionRunnerError(discovery.message)
@@ -341,10 +346,12 @@ class ProductionRunner:
             summary.failures += 1
             self.logger.emit("creator_failed", creator=name, error=str(error))
             return
+        entries = discovery.entries[:maximum]
         self.logger.emit(
-            "creator_checked", creator=name, discovered=len(discovery.entries)
+            "creator_checked", creator=name, discovered=len(discovery.entries),
+            considered=len(entries), max_videos_per_cycle=maximum,
         )
-        for metadata in discovery.entries:
+        for metadata in entries:
             video_id = metadata.get("id")
             if not isinstance(video_id, str) or not video_id.strip():
                 summary.failures += 1

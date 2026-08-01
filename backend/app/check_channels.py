@@ -2,7 +2,7 @@ import argparse
 from collections.abc import Sequence
 from pathlib import Path
 
-from backend.services.channel_manager import ChannelManager
+from backend.services.channel_manager import ChannelManager, channel_video_limit
 from backend.services.video_manifest import DEFAULT_MANIFEST_PATH, ManifestError
 from backend.services.youtube_downloader import DownloadStatus, YouTubeDownloader
 
@@ -71,17 +71,18 @@ def main(argv: Sequence[str] | None = ()) -> int:
 
     for channel in channels:
         try:
+            maximum = channel_video_limit(channel, args.max_videos)
             if args.dry_run:
                 result = downloader.discover_recent_channel_videos(
                     channel_name=channel["name"],
                     channel_url=channel["youtube_url"],
-                    max_videos=args.max_videos,
+                    max_videos=maximum,
                 )
             else:
                 result = downloader.download_recent_channel_videos(
                     channel_name=channel["name"],
                     channel_url=channel["youtube_url"],
-                    max_videos=args.max_videos,
+                    max_videos=maximum,
                 )
         except (TypeError, ValueError, ManifestError) as error:
             counts[DownloadStatus.FAILED] += 1
