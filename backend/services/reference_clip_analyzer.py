@@ -86,6 +86,7 @@ class ReferenceClipAnalyzer:
     ) -> dict[str, Any]:
         entry = self.library.get(reference_id)
         output_path = Path(entry["analysis_path"])
+        existing: dict[str, Any] | None = None
         if output_path.is_file() and not force:
             try:
                 existing = json.loads(output_path.read_text(encoding="utf-8"))
@@ -96,6 +97,13 @@ class ReferenceClipAnalyzer:
             if existing.get("reference_id") != reference_id:
                 raise ReferenceAnalysisError("Existing analysis belongs to another reference.")
             return existing
+        if output_path.is_file() and force:
+            try:
+                value = json.loads(output_path.read_text(encoding="utf-8"))
+                if isinstance(value, dict) and value.get("reference_id") == reference_id:
+                    existing = value
+            except (OSError, json.JSONDecodeError):
+                existing = None
         try:
             self.library.validate_checksum(reference_id)
             media_path = Path(entry["media_path"])
@@ -103,13 +111,36 @@ class ReferenceClipAnalyzer:
             probe = self._probe(media_path)
             scenes = self._scene_changes(media_path)
             silences = self._silences(media_path)
-            transcript = self._transcribe(media_path) if transcription else {"language": None, "words": []}
+            transcript = (
+                self._transcribe(media_path)
+                if transcription
+                else {"language": None, "words": []}
+            )
             speech = self._speech_metrics(transcript, probe["duration"])
+            now = utc_now()
+            previous_revision = self._analysis_revision(existing)
             document = {
-                "version": 1, "reference_id": reference_id, "created_at": utc_now(),
+                "version": 2,
+                "reference_id": reference_id,
+                "analysis_revision": previous_revision + 1,
+                "created_at": (
+                    existing.get("created_at")
+                    if existing and isinstance(existing.get("created_at"), str)
+                    else now
+                ),
+                "updated_at": now,
                 "media": {
                     **probe, "file_size_bytes": media_path.stat().st_size,
                     "checksum_sha256": sha256_file(media_path),
+                },
+                "transcription": {
+                    "requested": transcription,
+                    "status": "available" if transcription else "disabled",
+                    "language": transcript.get("language"),
+                    "word_timestamps": transcription,
+                    "evidence_kind": (
+                        "transcript_heuristic" if transcription else "unavailable"
+                    ),
                 },
                 "speech": speech,
                 "visual_timing": {
@@ -129,8 +160,17 @@ class ReferenceClipAnalyzer:
             return document
         except ReferenceAnalysisError:
             raise
-        except (OSError, ReferenceClipError, ValueError, TypeError) as error:
+        except Exception as error:
             raise ReferenceAnalysisError(f"Analysis failed for {reference_id}: {error}") from error
+
+    @staticmethod
+    def _analysis_revision(document: dict[str, Any] | None) -> int:
+        if document is None:
+            return 0
+        value = document.get("analysis_revision", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ReferenceAnalysisError("Existing analysis revision is invalid.")
+        return value
 
     def _run(self, command: Sequence[str], label: str) -> Any:
         result = self.runner(command)
@@ -254,10 +294,89 @@ class ReferenceClipAnalyzer:
             reactions.append("exclamation")
         if re.search(r"\b(ha){2,}\b", lower):
             reactions.append("laughter_language")
+        spoken_duration = (
+            max(0.0, float(last) - float(first))
+            if first is not None and last is not None else None
+        )
+        voiced_seconds = sum(
+            max(0.0, float(word["end"]) - float(word["start"]))
+            for word in words
+        )
+        early_text = " ".join(texts[:12]).casefold()
+        hook_signals = []
+        if words and float(first) <= 3.0:
+            hook_signals.append("speech_within_first_3_seconds")
+        if "?" in " ".join(texts[:12]):
+            hook_signals.append("early_question")
+        if "!" in " ".join(texts[:12]):
+            hook_signals.append("early_exclamation")
+        if any(term in early_text for term in reaction_terms):
+            hook_signals.append("early_reaction_language")
+        likely_hook = {
+            "status": "heuristic_signal" if hook_signals else (
+                "speech_start_only" if words else "unavailable"
+            ),
+            "timestamp": round(float(first), 3) if first is not None else None,
+            "signals": hook_signals,
+            "evidence_kind": "transcript_heuristic" if words else "unavailable",
+            "evidence": (
+                "Early transcript timing or language suggests a possible hook."
+                if hook_signals else
+                "Speech timing is available, but no hook-language signal was detected."
+                if words else "No word-level transcript evidence is available."
+            ),
+        }
+        payoff_word_indexes = []
+        for index in range(len(texts)):
+            window = " ".join(texts[max(0, index - 3):index + 1]).casefold()
+            if any(term in window for term in payoff_terms):
+                payoff_word_indexes.append(index)
+        if reactions and words:
+            for index, text in enumerate(texts):
+                if "!" in text and index >= len(texts) // 2:
+                    payoff_word_indexes.append(index)
+        payoff_index = max(payoff_word_indexes) if payoff_word_indexes else None
+        payoff_time = (
+            float(words[payoff_index]["end"])
+            if payoff_index is not None else None
+        )
+        likely_payoff = {
+            "status": "heuristic_signal" if payoff_time is not None else "unavailable",
+            "timestamp": round(payoff_time, 3) if payoff_time is not None else None,
+            "signals": payoffs + (["late_exclamation"] if payoff_time is not None and reactions else []),
+            "evidence_kind": (
+                "transcript_heuristic" if payoff_time is not None else "unavailable"
+            ),
+            "evidence": (
+                "Transcript language or a late exclamation suggests a possible payoff."
+                if payoff_time is not None else
+                "No transcript-language payoff signal was detected."
+            ),
+        }
+        unresolved = []
+        stripped = full_text.rstrip()
+        if stripped.endswith("?"):
+            unresolved.append("ending_question")
+        if stripped and not re.search(r"[.!?][\"']?$", stripped):
+            unresolved.append("no_terminal_sentence_boundary")
+        last_question = max(
+            (index for index, text in enumerate(texts) if "?" in text),
+            default=None,
+        )
+        if last_question is not None and (
+            payoff_index is None or last_question > payoff_index
+        ):
+            unresolved.append("question_without_later_payoff_signal")
         return {
             "language": transcript.get("language"), "words": words,
             "word_count": len(words),
             "words_per_second": round(len(words) / duration, 4) if duration else 0,
+            "words_per_spoken_second": (
+                round(len(words) / spoken_duration, 4)
+                if spoken_duration and spoken_duration > 0 else None
+            ),
+            "spoken_duration": round(spoken_duration, 3) if spoken_duration is not None else None,
+            "speech_density": round(voiced_seconds / duration, 4) if duration else 0,
             "first_word_start": round(first, 3) if first is not None else None,
             "initial_speech_delay": round(first, 3) if first is not None else None,
             "last_word_end": round(last, 3) if last is not None else None,
@@ -267,5 +386,13 @@ class ReferenceClipAnalyzer:
             ],
             "questions": questions, "reaction_signals": reactions,
             "payoff_signals": payoffs,
+            "transcript_excerpt": full_text[:500],
+            "likely_hook": likely_hook,
+            "likely_payoff": likely_payoff,
+            "unresolved_ending_indicators": unresolved,
+            "post_payoff_tail": (
+                round(max(0.0, duration - payoff_time), 3)
+                if payoff_time is not None else None
+            ),
             "signal_evidence_kind": "transcript_heuristic",
         }

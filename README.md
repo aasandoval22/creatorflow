@@ -463,10 +463,57 @@ python -m backend.app.reference_clips build-profile personality_reaction
 ```
 
 Analysis uses local FFprobe and FFmpeg plus the existing optional
-faster-whisper runtime. Use `--no-transcription` when only media, scene-change,
-and silence measurements are wanted. Scene changes are pixel-change signals,
-and transcript reaction/payoff findings are heuristics; neither proves humor or
-quality.
+faster-whisper runtime. To replace an existing analysis with word-timed speech
+evidence, run:
+
+```bash
+.venv/bin/python -m backend.app.reference_clips analyze \
+  --reference-id REFERENCE_ID --with-transcription --force
+```
+
+The replacement is atomic and advances an analysis revision. A transcription
+failure preserves the previous valid analysis. Use `--no-transcription` when
+only media, scene-change, and silence measurements are wanted. Scene changes
+are pixel-change signals, and transcript hook, reaction, question, payoff, and
+ending findings are explicitly heuristic; none proves humor, quality,
+originality, or virality.
+
+Accepted-reference inspection and annotation are available at `/references`
+on the loopback review server. Each reference page shows its playable media,
+checksum, automatic measurements, sanitized analysis, profile contribution,
+and local audit history. Structured human fields cover composition, facecam
+presence, opening, purpose, pacing, payoff, captions, desired or undesirable
+qualities, and reviewer notes. Unset fields remain `unknown`; no annotations
+are fabricated. Saves, reanalysis requests, and explicit profile rebuilds are
+token-protected POST actions with annotation-revision and replay protection.
+The annotation page cannot delete or withdraw a reference.
+
+Human annotations are separate versioned files under
+`data/reference_annotations/`, and automatic reanalysis never rewrites them or
+the baseline's existing qualities and notes. The optional private
+`AUTOCLIP_REVIEWER_NAME` value is recorded only as a display label. Evidence
+changes and sanitized failures are appended to
+`data/reference_annotations/events.jsonl`; tokens, keys, cookies,
+authorization headers, and private environment values are excluded.
+
+The same operations are available from the CLI:
+
+```bash
+.venv/bin/python -m backend.app.reference_clips show-annotations REFERENCE_ID
+.venv/bin/python -m backend.app.reference_clips annotate REFERENCE_ID \
+  --expected-revision 0 --composition full_screen_gameplay \
+  --opening-style immediate_action --pacing fast
+.venv/bin/python -m backend.app.reference_clips evidence-history REFERENCE_ID
+.venv/bin/python -m backend.app.reference_clips build-profile gaming_highlight
+```
+
+Profile version 2 keeps observed automatic metrics separate from aggregated
+human preferences, reports contributor counts, and records every analysis and
+annotation revision used. Human fields require at least two annotated
+references before aggregation. A later reanalysis or annotation marks affected
+profiles stale but never rebuilds them; rebuilding remains an explicit command.
+Profiles remain descriptive soft evidence and are never applied to production
+selection, rendering, timing, captions, or publishing automatically.
 
 Compare rejected previews for a video:
 

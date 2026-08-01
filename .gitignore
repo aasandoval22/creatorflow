@@ -36,6 +36,7 @@ data/review_queue/
 data/models/
 data/reference_clips/
 data/reference_profiles/
+data/reference_annotations/
 data/reference_comparisons/
 data/reference_discovery/
 data/reference_discovery/decision_events.jsonl

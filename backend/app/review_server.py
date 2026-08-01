@@ -26,9 +26,19 @@ from backend.services.clip_review_queue import (
 )
 from backend.services.clip_timing_adjustment import ClipTimingAdjustmentService
 from backend.services.reference_clip_comparator import ReferenceClipComparator
+from backend.services.reference_clip_analyzer import ReferenceAnalysisError
 from backend.services.reference_clip_library import ReferenceClipLibrary
+from backend.services.reference_annotations import (
+    ENUM_FIELDS, ReferenceAnnotationError, ReferenceAnnotationStore,
+)
 from backend.services.reference_decision_audit import ReferenceDecisionAuditError
-from backend.services.reference_profile_builder import ReferenceProfileBuilder
+from backend.services.reference_evidence_audit import ReferenceEvidenceAuditError
+from backend.services.reference_evidence_service import (
+    ReferenceEvidenceError, ReferenceEvidenceService,
+)
+from backend.services.reference_profile_builder import (
+    ReferenceProfileBuilder, ReferenceProfileError,
+)
 from backend.services.reference_discovery import (
     ReferenceCandidateQueue, ReferenceDiscoveryError, ReferenceDiscoveryService,
     YouTubeDataAPI,
@@ -81,6 +91,7 @@ class ReviewApplication:
     reference_profile: str = "personality_reaction"
     reference_candidate_queue: ReferenceCandidateQueue | None = None
     reference_discovery_service: ReferenceDiscoveryService | None = None
+    reference_evidence_service: ReferenceEvidenceService | None = None
 
 
 class ReviewHTTPServer(ThreadingHTTPServer):
@@ -129,6 +140,16 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         route = urlsplit(self.path)
         if route.path == "/":
             self._index(route.query, head=False)
+        elif route.path == "/references":
+            self._accepted_references(route.query, head=False)
+        elif self._reference_analysis_route(route.path) is not None:
+            self._reference_analysis(
+                self._reference_analysis_route(route.path) or "", head=False
+            )
+        elif route.path.startswith("/accepted-reference-media/"):
+            self._accepted_reference_media(
+                route.path.removeprefix("/accepted-reference-media/"), head=False
+            )
         elif route.path == "/reference-candidates":
             self._reference_candidates(route.query, head=False)
         elif route.path.startswith("/reference-media/"):
@@ -137,7 +158,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             )
         elif route.path.startswith("/media/"):
             self._media(route.path.removeprefix("/media/"), head=False)
-        elif self._write_route(route.path):
+        elif self._write_route(route.path) or self._evidence_write_route(route.path):
             self._text(HTTPStatus.METHOD_NOT_ALLOWED, "This route accepts POST only.")
         else:
             self._text(HTTPStatus.NOT_FOUND, "The requested local resource was not found.")
@@ -146,6 +167,16 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         route = urlsplit(self.path)
         if route.path == "/":
             self._index(route.query, head=True)
+        elif route.path == "/references":
+            self._accepted_references(route.query, head=True)
+        elif self._reference_analysis_route(route.path) is not None:
+            self._reference_analysis(
+                self._reference_analysis_route(route.path) or "", head=True
+            )
+        elif route.path.startswith("/accepted-reference-media/"):
+            self._accepted_reference_media(
+                route.path.removeprefix("/accepted-reference-media/"), head=True
+            )
         elif route.path == "/reference-candidates":
             self._reference_candidates(route.query, head=True)
         elif route.path.startswith("/reference-media/"):
@@ -154,13 +185,17 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             )
         elif route.path.startswith("/media/"):
             self._media(route.path.removeprefix("/media/"), head=True)
-        elif self._write_route(route.path):
+        elif self._write_route(route.path) or self._evidence_write_route(route.path):
             self._text(HTTPStatus.METHOD_NOT_ALLOWED, "This route accepts POST only.", head=True)
         else:
             self._text(HTTPStatus.NOT_FOUND, "The requested local resource was not found.", head=True)
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
+        evidence_route = self._evidence_write_route(path)
+        if evidence_route is not None:
+            self._reference_evidence_action(*evidence_route)
+            return
         reference_route = self._reference_write_route(path)
         if reference_route is not None:
             self._reference_decision(*reference_route)
@@ -224,6 +259,30 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             review_id = parts[1]
             if review_id and "/" not in review_id and review_id.startswith("review_"):
                 return review_id, parts[2]
+        return None
+
+    @staticmethod
+    def _evidence_write_route(path: str) -> tuple[str, str] | None:
+        parts = path.strip("/").split("/")
+        if (
+            len(parts) == 3
+            and parts[0] == "references"
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", parts[1])
+            and parts[2] in {"annotations", "reanalyze", "rebuild-profile"}
+        ):
+            return parts[1], parts[2]
+        return None
+
+    @staticmethod
+    def _reference_analysis_route(path: str) -> str | None:
+        parts = path.strip("/").split("/")
+        if (
+            len(parts) == 3
+            and parts[0] == "references"
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", parts[1])
+            and parts[2] == "analysis"
+        ):
+            return parts[1]
         return None
 
     @staticmethod
@@ -493,6 +552,108 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             return
         self._reference_redirect("success", message)
 
+    def _reference_evidence_action(self, reference_id: str, action: str) -> None:
+        service = self.server.app.reference_evidence_service
+        if service is None:
+            self._text(HTTPStatus.NOT_FOUND, "Accepted-reference evidence is not configured.")
+            return
+        try:
+            form = self._form()
+            self._require_token(form)
+            request_id = self._one(form, "request_id", required=True)
+            revision_value = self._one(
+                form, "expected_annotation_revision", required=True
+            )
+            try:
+                expected_revision = int(revision_value or "")
+            except ValueError as error:
+                raise RequestError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Annotation revision is invalid; refresh and retry.",
+                ) from error
+            if action == "annotations":
+                values: dict[str, Any] = {}
+                for name in ENUM_FIELDS:
+                    values[name] = self._one(form, name, required=True)
+                values["desired_qualities"] = self._lines(
+                    self._one(form, "desired_qualities") or ""
+                )
+                values["undesirable_qualities"] = self._lines(
+                    self._one(form, "undesirable_qualities") or ""
+                )
+                values["reviewer_notes"] = self._one(
+                    form, "reviewer_notes"
+                ) or ""
+                updated = service.update_annotations(
+                    reference_id,
+                    expected_revision=expected_revision,
+                    values=values,
+                    request_id=request_id,
+                )
+                message = (
+                    f"{reference_id} annotations saved at revision "
+                    f"{updated['revision']}."
+                )
+            elif action == "reanalyze":
+                result = service.reanalyze(
+                    reference_id,
+                    transcription=True,
+                    force=True,
+                    expected_annotation_revision=expected_revision,
+                    request_id=request_id,
+                )
+                message = (
+                    f"{reference_id} reanalyzed with transcription at analysis "
+                    f"revision {result.get('analysis_revision', 0)}."
+                )
+            else:
+                entry = service.accepted_entry(reference_id)
+                profile = service.rebuild_profile(
+                    entry["profile_name"],
+                    trigger_reference_id=reference_id,
+                    expected_annotation_revision=expected_revision,
+                    request_id=request_id,
+                )
+                message = (
+                    f"{entry['profile_name']} rebuilt explicitly from "
+                    f"{profile['reference_count']} accepted reference(s)."
+                )
+        except RequestError as error:
+            self._text(error.status, error.message)
+            return
+        except (
+            ReferenceAnnotationError,
+            ReferenceAnalysisError,
+            ReferenceEvidenceAuditError,
+            ReferenceEvidenceError,
+            ReferenceProfileError,
+            OSError,
+            ValueError,
+        ) as error:
+            self.log_error(
+                "accepted reference evidence request failed: %s",
+                type(error).__name__,
+            )
+            self._accepted_reference_redirect(
+                "error", "Reference evidence action failed; prior state was preserved."
+            )
+            return
+        self._accepted_reference_redirect("success", message)
+
+    @staticmethod
+    def _lines(value: str) -> list[str]:
+        return [line.strip() for line in value.splitlines() if line.strip()]
+
+    def _accepted_reference_redirect(self, kind: str, message: str) -> None:
+        location = "/references?" + urlencode({kind: message})
+        self.send_response(HTTPStatus.SEE_OTHER)
+        for name, value in SECURITY_HEADERS.items():
+            self.send_header(name, value)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _reference_redirect(self, kind: str, message: str) -> None:
         location = "/reference-candidates?" + urlencode({kind: message})
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -604,6 +765,97 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         self._headers(HTTPStatus.OK, "text/html; charset=utf-8", len(body))
         if not head:
             self.wfile.write(body)
+
+    def _accepted_references(self, query: str, *, head: bool) -> None:
+        service = self.server.app.reference_evidence_service
+        if service is None:
+            self._text(
+                HTTPStatus.NOT_FOUND, "Accepted-reference evidence is not configured.",
+                head=head,
+            )
+            return
+        try:
+            parameters = parse_qs(query)
+            profile_name = parameters.get("profile", [None])[0]
+            if profile_name is not None and not re.fullmatch(
+                r"[a-z0-9][a-z0-9_-]{0,63}", profile_name
+            ):
+                raise ReferenceEvidenceError("Invalid profile filter.")
+            items = service.list_accepted(profile_name=profile_name)
+            body = render_accepted_references(
+                items,
+                self.server.app.form_token,
+                notice=parameters.get(
+                    "success", parameters.get("error", [None])
+                )[0],
+                notice_error="error" in parameters,
+            ).encode()
+        except (
+            ReferenceAnnotationError,
+            ReferenceEvidenceAuditError,
+            ReferenceEvidenceError,
+            ReferenceProfileError,
+            OSError,
+            ValueError,
+        ) as error:
+            self.log_error(
+                "accepted reference page failed: %s", type(error).__name__
+            )
+            self._text(HTTPStatus.BAD_REQUEST, str(error), head=head)
+            return
+        self._headers(HTTPStatus.OK, "text/html; charset=utf-8", len(body))
+        if not head:
+            self.wfile.write(body)
+
+    def _reference_analysis(self, reference_id: str, *, head: bool) -> None:
+        service = self.server.app.reference_evidence_service
+        if service is None:
+            self._text(HTTPStatus.NOT_FOUND, "Reference analysis was not found.", head=head)
+            return
+        try:
+            analysis = service.inspect(reference_id)["analysis"]
+            if analysis is None:
+                raise ReferenceEvidenceError("Reference has no analysis.")
+            rendered = html.escape(json.dumps(analysis, indent=2, sort_keys=True))
+            body = (
+                "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                f"<title>{_e(reference_id)} analysis</title></head><body>"
+                f"<h1>{_e(reference_id)} sanitized analysis</h1>"
+                "<p>Transcript findings are heuristics, not proof of humor, quality, "
+                "originality, or virality.</p><p><a href=\"/references\">Return to "
+                f"accepted references</a></p><pre>{rendered}</pre></body></html>"
+            ).encode()
+        except (
+            ReferenceEvidenceAuditError,
+            ReferenceEvidenceError,
+            OSError,
+            ValueError,
+        ) as error:
+            self.log_error(
+                "accepted reference analysis failed: %s", type(error).__name__
+            )
+            self._text(HTTPStatus.NOT_FOUND, str(error), head=head)
+            return
+        self._headers(HTTPStatus.OK, "text/html; charset=utf-8", len(body))
+        if not head:
+            self.wfile.write(body)
+
+    def _accepted_reference_media(self, reference_id: str, *, head: bool) -> None:
+        service = self.server.app.reference_evidence_service
+        if service is None or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", reference_id):
+            self._text(HTTPStatus.NOT_FOUND, "Reference media was not found.", head=head)
+            return
+        try:
+            entry = service.accepted_entry(reference_id)
+            path = Path(entry["media_path"])
+            if not path.is_file():
+                raise OSError
+            size = path.stat().st_size
+        except (ReferenceEvidenceError, OSError):
+            self._text(HTTPStatus.NOT_FOUND, "Reference media was not found.", head=head)
+            return
+        self._send_file(path, size, head=head)
 
     def _reference_media(self, video_id: str, *, head: bool) -> None:
         queue = self.server.app.reference_candidate_queue
@@ -777,6 +1029,7 @@ textarea{{width:100%;min-height:5rem}}fieldset{{margin:.8rem 0;padding:.8rem}}la
 </style></head><body>
 <header><h1>CreatorFlow interactive local review</h1>
 <p><a href="/reference-candidates">Review discovered reference candidates</a></p>
+<p><a href="/references">Inspect and annotate accepted references</a></p>
 <p>Queue updated: {_e(updated_at)}</p>
 <form method="get" action="/"><label>Status <select name="status"><option value="">All</option>
 <option>pending</option><option>approved</option><option>rejected</option></select></label>
@@ -925,12 +1178,173 @@ label{{display:block;margin:.6rem 0}}button{{padding:.5rem;margin:.2rem}}
 @media(max-width:700px){{.card{{grid-template-columns:1fr}}}}</style></head>
 <body><header><h1>Discovered gaming reference candidates</h1>
 <p><a href="/">Return to generated clip reviews</a></p>
+<p><a href="/references">Inspect accepted references</a></p>
 <p>Discovery scores are transparent heuristics, not measurements of humor,
 quality, or virality. Nothing here influences profiles until a human accepts it.</p>
 <form method="get"><label>Status <select name="status"><option value="">All</option>
 <option>discovered</option><option>accepted</option><option>rejected</option>
 <option>duplicate</option></select></label><button>Filter</button></form></header>
 {banner}{''.join(cards) or '<p>No reference candidates match.</p>'}</body></html>"""
+
+
+def render_accepted_references(
+    items: list[dict[str, Any]], token: str, *,
+    notice: str | None = None, notice_error: bool = False,
+) -> str:
+    banner = (
+        f'<p class="notice {"error" if notice_error else "success"}">{_e(notice)}</p>'
+        if notice else ""
+    )
+    labels = {
+        "composition": "Composition",
+        "facecam_presence": "Facecam presence",
+        "opening_style": "Opening style",
+        "clip_purpose": "Clip purpose",
+        "pacing": "Pacing",
+        "payoff_type": "Payoff type",
+        "caption_style": "Caption style",
+    }
+    cards = []
+    for item in sorted(
+        items, key=lambda value: value["entry"]["reference_id"]
+    ):
+        entry = item["entry"]
+        reference_id = entry["reference_id"]
+        encoded_id = quote(reference_id, safe="")
+        analysis = item.get("analysis") or {}
+        media = analysis.get("media") or {}
+        speech = analysis.get("speech") or {}
+        transcription = analysis.get("transcription") or {}
+        visual = analysis.get("visual_timing") or {}
+        audio = analysis.get("audio_timing") or {}
+        annotation = item["annotation"]
+        values = annotation["annotations"]
+        select_fields = []
+        for name, choices in ENUM_FIELDS.items():
+            options = "".join(
+                f'<option value="{_e(choice)}"'
+                f'{" selected" if values[name] == choice else ""}>'
+                f'{_e(choice.replace("_", " ").title())}</option>'
+                for choice in sorted(choices)
+            )
+            select_fields.append(
+                f'<label>{_e(labels[name])}<select name="{_e(name)}" required>'
+                f'{options}</select></label>'
+            )
+        common = (
+            f'<input type="hidden" name="form_token" value="{_e(token)}">'
+            f'<input type="hidden" name="expected_annotation_revision" '
+            f'value="{_e(annotation["revision"])}">'
+        )
+        membership = item.get("profile_membership") or []
+        membership_html = "".join(
+            "<li>"
+            f"{_e(value['profile_name'])}: "
+            f"{_e(value.get('staleness', {}).get('status', 'unavailable'))}"
+            "</li>"
+            for value in membership
+        ) or "<li>Not present in a built profile.</li>"
+        history = item.get("history") or []
+        history_html = "".join(
+            "<li>"
+            f"{_e(event.get('timestamp'))}: {_e(event.get('action'))} — "
+            f"{_e(event.get('result'))}; annotation "
+            f"{_e(event.get('previous_annotation_revision'))} → "
+            f"{_e(event.get('new_annotation_revision'))}; analysis "
+            f"{_e(event.get('previous_analysis_revision'))} → "
+            f"{_e(event.get('new_analysis_revision'))}; reviewer "
+            f"{_e(event.get('reviewer') or 'not configured')}"
+            + (
+                f"; reason {_e(event.get('failure_reason'))}"
+                if event.get("failure_reason") else ""
+            )
+            + "</li>"
+            for event in history
+        ) or "<li>No evidence audit events yet.</li>"
+        hook = speech.get("likely_hook") or {}
+        payoff = speech.get("likely_payoff") or {}
+        source_link = (
+            f'<a href="{_e(item["source_url"])}" rel="noreferrer">Open source</a>'
+            if item.get("source_url") else "Source URL unavailable"
+        )
+        annotation_request = secrets.token_urlsafe(16)
+        analysis_request = secrets.token_urlsafe(16)
+        profile_request = secrets.token_urlsafe(16)
+        cards.append(f"""<article class="card">
+<div><video controls preload="metadata"
+src="/accepted-reference-media/{encoded_id}"></video></div><div>
+<h2>{_e(item['baseline'].get('source_title') or reference_id)}</h2>
+<p><strong>Reference:</strong> {_e(reference_id)} ·
+<strong>Category:</strong> {_e(entry['profile_name'])}<br>
+<strong>Creator:</strong> {_e(entry['creator'])} · {source_link}<br>
+<strong>Media:</strong> {_e(media.get('duration'))}s,
+{_e(media.get('width'))}×{_e(media.get('height'))},
+{_e(media.get('frame_rate'))} fps<br>
+<strong>Checksum:</strong> {_e('valid' if item['checksum_valid'] else 'invalid')}<br>
+<strong>Analysis revision:</strong> {_e(analysis.get('analysis_revision', 0))} ·
+<strong>Annotation revision:</strong> {_e(annotation['revision'])}</p>
+<section><h3>Automatic evidence</h3>
+<p><strong>Transcript:</strong> {_e(transcription.get('status', 'legacy/unavailable'))} ·
+language={_e(speech.get('language'))} · words={_e(speech.get('word_count'))} ·
+speech start={_e(speech.get('first_word_start'))} · end={_e(speech.get('last_word_end'))} ·
+spoken span={_e(speech.get('spoken_duration'))}s ·
+words/media-s={_e(speech.get('words_per_second'))} ·
+words/spoken-s={_e(speech.get('words_per_spoken_second'))} ·
+density={_e(speech.get('speech_density'))}</p>
+<p><strong>Excerpt:</strong> {_e(speech.get('transcript_excerpt') or 'Unavailable')}</p>
+<p><strong>Hook heuristic:</strong> {_e(hook.get('status', 'unavailable'))} at
+{_e(hook.get('timestamp'))}s — {_e(hook.get('evidence', 'Unavailable'))}<br>
+<strong>Payoff heuristic:</strong> {_e(payoff.get('status', 'unavailable'))} at
+{_e(payoff.get('timestamp'))}s — {_e(payoff.get('evidence', 'Unavailable'))}<br>
+<strong>Unresolved ending indicators:</strong>
+{_e(', '.join(speech.get('unresolved_ending_indicators', [])) or 'none detected/unavailable')}<br>
+<strong>Post-speech tail:</strong> {_e(speech.get('post_speech_tail'))}s ·
+<strong>Post-payoff tail:</strong> {_e(speech.get('post_payoff_tail'))}s</p>
+<p><strong>Meaningful speech pauses:</strong>
+{_e(len(speech.get('meaningful_pauses', [])))} ·
+<strong>Scene-change signals:</strong>
+{_e(len(visual.get('scene_change_timestamps', [])))} ·
+<strong>Silence intervals:</strong> {_e(len(audio.get('silence_intervals', [])))}</p>
+<p>Transcript and timing findings are heuristic evidence. They do not measure humor,
+quality, originality, or virality.</p>
+<p><a href="/references/{encoded_id}/analysis">Inspect complete sanitized analysis</a></p>
+</section>
+<section><h3>Profile contribution</h3><ul>{membership_html}</ul></section>
+<form method="post" action="/references/{encoded_id}/annotations">
+{common}<input type="hidden" name="request_id" value="{_e(annotation_request)}">
+<fieldset><legend>Human style annotations</legend>
+{''.join(select_fields)}
+<label>Desired qualities, one per line<textarea name="desired_qualities">{_e(chr(10).join(values['desired_qualities']))}</textarea></label>
+<label>Undesirable qualities, one per line<textarea name="undesirable_qualities">{_e(chr(10).join(values['undesirable_qualities']))}</textarea></label>
+<label>Reviewer notes<textarea name="reviewer_notes" maxlength="{MAX_NOTE}">{_e(values['reviewer_notes'])}</textarea></label>
+<button>Save annotations</button></fieldset></form>
+<form method="post" action="/references/{encoded_id}/reanalyze">
+{common}<input type="hidden" name="request_id" value="{_e(analysis_request)}">
+<p>Reanalysis uses local faster-whisper word timestamps and atomically preserves the
+current analysis if it fails.</p><button>Reanalyze with transcription</button></form>
+<form method="post" action="/references/{encoded_id}/rebuild-profile">
+{common}<input type="hidden" name="request_id" value="{_e(profile_request)}">
+<p>Profile rebuilding is explicit and does not change production defaults.</p>
+<button>Rebuild {_e(entry['profile_name'])} profile</button></form>
+<section><h3>Recent evidence history</h3><ul>{history_html}</ul></section>
+</div></article>""")
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CreatorFlow accepted references</title><style>
+body{{font:16px system-ui;max-width:1280px;margin:auto;padding:1rem}}
+.card{{display:grid;grid-template-columns:minmax(240px,360px) 1fr;gap:1rem;
+border:1px solid #ccc;padding:1rem;margin:1rem 0}}video{{width:100%;aspect-ratio:9/16;
+background:#111}}label{{display:block;margin:.6rem 0}}select,textarea{{display:block;
+width:100%;max-width:44rem;box-sizing:border-box}}textarea{{min-height:5rem}}
+button{{padding:.55rem;margin:.25rem}}.notice{{border:2px solid;padding:.7rem}}
+.error{{border-color:#b00}}.success{{border-color:#285}}
+@media(max-width:700px){{.card{{grid-template-columns:1fr}}}}</style></head>
+<body><header><h1>Accepted reference evidence</h1>
+<p><a href="/">Generated clip reviews</a> ·
+<a href="/reference-candidates">Discovered reference candidates</a></p>
+<p>Human annotations remain separate from automatic analysis. Profile rebuilds are
+explicit and never alter production selection or rendering defaults.</p></header>
+{banner}{''.join(cards) or '<p>No accepted references match.</p>'}</body></html>"""
 
 
 def _card(
@@ -1066,16 +1480,25 @@ def create_application(args: argparse.Namespace) -> ReviewApplication:
     service = ClipTimingAdjustmentService(
         queue, renderer, maximum_duration=args.maximum_render_duration
     )
-    comparator = ReferenceClipComparator(
-        ReferenceProfileBuilder(ReferenceClipLibrary())
+    reference_library = ReferenceClipLibrary()
+    annotation_store = ReferenceAnnotationStore()
+    profile_builder = ReferenceProfileBuilder(
+        reference_library, annotation_store=annotation_store
     )
+    comparator = ReferenceClipComparator(profile_builder)
     candidate_queue = ReferenceCandidateQueue()
     discovery_service = ReferenceDiscoveryService(
         YouTubeDataAPI(), candidate_queue
     )
+    evidence_service = ReferenceEvidenceService(
+        reference_library,
+        annotations=annotation_store,
+        profile_builder=profile_builder,
+    )
     return ReviewApplication(
         queue, service, secrets.token_urlsafe(32), args.maximum_render_duration,
         comparator, args.reference_profile, candidate_queue, discovery_service,
+        evidence_service,
     )
 
 
