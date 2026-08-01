@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import json
 import math
 import os
@@ -11,7 +12,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -23,7 +26,16 @@ from urllib.request import Request, urlopen
 import yt_dlp
 
 from backend.services.reference_clip_analyzer import ReferenceClipAnalyzer
-from backend.services.reference_clip_library import ReferenceClipLibrary
+from backend.services.reference_clip_library import (
+    ReferenceClipError,
+    ReferenceClipLibrary,
+    load_and_validate_baseline,
+)
+from backend.services.reference_decision_audit import (
+    ReferenceDecisionAuditError,
+    ReferenceDecisionAuditLedger,
+    configured_reviewer_name,
+)
 from backend.services.video_manifest import utc_now
 from backend.services.youtube_downloader import (
     YtDlpRuntimeConfiguration,
@@ -38,12 +50,22 @@ DEFAULT_ROOT = DEFAULT_DATA_ROOT / "reference_discovery"
 DEFAULT_QUEUE_PATH = DEFAULT_ROOT / "candidates.json"
 DEFAULT_MEDIA_ROOT = DEFAULT_DATA_ROOT / REFERENCE_MEDIA_RELATIVE_ROOT
 DEFAULT_REFERENCE_ROOT = PROJECT_ROOT / "data" / "reference_clips"
+DEFAULT_PROFILE_ROOT = PROJECT_ROOT / "data" / "reference_profiles"
+DEFAULT_AUDIT_PATH = DEFAULT_ROOT / "decision_events.jsonl"
+DEFAULT_DECISION_LOCK = DEFAULT_ROOT / ".decision.lock"
+DEFAULT_WITHDRAWAL_RECOVERY_ROOT = DEFAULT_ROOT / "withdrawal_recovery"
 DEFAULT_ENVIRONMENT_FILE = Path.home() / ".config" / "creatorflow" / "creatorflow.env"
 QUEUE_VERSION = 1
 SCORE_VERSION = 2
 RELEVANCE_VERSION = 1
 SOURCE_QUALITY_VERSION = 1
 STATUSES = frozenset({"discovered", "accepted", "rejected", "duplicate"})
+LEGAL_ACTIONS = {
+    "discovered": frozenset({"accept", "reject", "duplicate"}),
+    "accepted": frozenset({"withdraw"}),
+    "rejected": frozenset({"reconsider"}),
+    "duplicate": frozenset({"reconsider"}),
+}
 DEFAULT_QUERIES = (
     "gaming funny moments shorts",
     "streamer reaction gaming shorts",
@@ -1157,6 +1179,22 @@ class ReferenceCandidateQueue:
         return {"version": QUEUE_VERSION, "updated_at": utc_now(), "items": []}
 
     @staticmethod
+    def revision(item: Mapping[str, Any]) -> int:
+        value = item.get("revision", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ReferenceDiscoveryError(
+                f"Reference candidate {item.get('video_id', '<unknown>')} "
+                "has an invalid revision."
+            )
+        return value
+
+    @classmethod
+    def _public_item(cls, item: Mapping[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(dict(item))
+        result["revision"] = cls.revision(item)
+        return result
+
+    @staticmethod
     def _canonical_relative_path(filename: str) -> str:
         return (REFERENCE_MEDIA_RELATIVE_ROOT / filename).as_posix()
 
@@ -1342,6 +1380,7 @@ class ReferenceCandidateQueue:
                 or item["video_id"] in ids
             ):
                 raise ReferenceDiscoveryError("Reference candidate queue has an invalid item.")
+            self.revision(item)
             ids.add(item["video_id"])
         return document
 
@@ -1349,15 +1388,75 @@ class ReferenceCandidateQueue:
         if status is not None and status not in STATUSES:
             raise ReferenceDiscoveryError(f"Unsupported candidate status {status!r}.")
         return [
-            copy.deepcopy(item) for item in self._load()["items"]
+            self._public_item(item) for item in self._load()["items"]
             if status is None or item["status"] == status
         ]
 
     def get(self, video_id: str) -> dict[str, Any]:
         for item in self._load()["items"]:
             if item["video_id"] == video_id:
-                return copy.deepcopy(item)
+                return self._public_item(item)
         raise ReferenceDiscoveryError(f"Reference candidate {video_id!r} does not exist.")
+
+    def snapshot(self) -> dict[str, Any]:
+        return copy.deepcopy(self._load())
+
+    def restore(self, document: dict[str, Any]) -> None:
+        restored = copy.deepcopy(document)
+        for item in restored.get("items", []):
+            self.revision(item)
+        _atomic_json(self.path, restored)
+
+    def transition(
+        self,
+        video_id: str,
+        *,
+        expected_revision: int,
+        expected_status: str,
+        status: str,
+        notes: str | None = None,
+        category: str | None = None,
+        topic: str | None = None,
+        accepted_reference_id: str | None = None,
+        clear_accepted_reference: bool = False,
+    ) -> dict[str, Any]:
+        if status not in STATUSES or expected_status not in STATUSES:
+            raise ReferenceDiscoveryError("Candidate transition status is invalid.")
+        document = self._load()
+        for item in document["items"]:
+            if item["video_id"] != video_id:
+                continue
+            revision = self.revision(item)
+            if revision != expected_revision:
+                raise ReferenceDiscoveryError(
+                    f"Stale candidate form: expected revision {expected_revision}, "
+                    f"current revision is {revision}. Refresh and retry."
+                )
+            if item["status"] != expected_status:
+                raise ReferenceDiscoveryError(
+                    f"Candidate {video_id} is {item['status']}, not "
+                    f"{expected_status}; refresh and retry."
+                )
+            item["status"] = status
+            if notes is not None:
+                item["notes"] = notes
+            if category is not None:
+                item["category"] = category
+            if topic is not None:
+                item["topic"] = topic
+                item["topic_manually_corrected"] = True
+            if clear_accepted_reference:
+                item["accepted_reference_id"] = None
+            elif accepted_reference_id is not None:
+                item["accepted_reference_id"] = accepted_reference_id
+            item["revision"] = revision + 1
+            item["updated_at"] = utc_now()
+            document["updated_at"] = item["updated_at"]
+            _atomic_json(self.path, document)
+            return self._public_item(item)
+        raise ReferenceDiscoveryError(
+            f"Reference candidate {video_id!r} does not exist."
+        )
 
     def upsert_discovered(self, candidates: Sequence[dict[str, Any]]) -> None:
         document = self._load()
@@ -1392,6 +1491,9 @@ class ReferenceCandidateQueue:
                 "created_at": (previous or {}).get("created_at", now),
                 "updated_at": now,
                 "origin": "automatic_youtube_discovery",
+                "revision": (
+                    self.revision(previous) + 1 if previous is not None else 0
+                ),
             }
             existing[item["video_id"]] = item
         document["items"] = sorted(existing.values(), key=lambda item: item["video_id"])
@@ -1403,11 +1505,24 @@ class ReferenceCandidateQueue:
         category: str | None = None, topic: str | None = None,
         accepted_reference_id: str | None = None,
     ) -> dict[str, Any]:
+        """Update non-accepted compatibility state.
+
+        Interactive and CLI decisions must use ReferenceDiscoveryService so
+        revisions, transition rules, and audit events are enforced.
+        """
+
         if status not in STATUSES:
             raise ReferenceDiscoveryError(f"Unsupported candidate status {status!r}.")
         document = self._load()
         for item in document["items"]:
             if item["video_id"] == video_id:
+                if (
+                    (item["status"] == "accepted") != (status == "accepted")
+                ):
+                    raise ReferenceDiscoveryError(
+                        "Transitions into or out of accepted require the "
+                        "reference decision service."
+                    )
                 item["status"] = status
                 if notes is not None:
                     item["notes"] = notes
@@ -1418,6 +1533,7 @@ class ReferenceCandidateQueue:
                     item["topic_manually_corrected"] = True
                 if accepted_reference_id is not None:
                     item["accepted_reference_id"] = accepted_reference_id
+                item["revision"] = self.revision(item) + 1
                 item["updated_at"] = utc_now()
                 document["updated_at"] = item["updated_at"]
                 _atomic_json(self.path, document)
@@ -1448,6 +1564,7 @@ class ReferenceCandidateQueue:
                     )
                 ):
                     item[name] = copy.deepcopy(value)
+            item["revision"] = self.revision(item) + 1
             item["updated_at"] = now
         document["updated_at"] = now
         _atomic_json(self.path, document)
@@ -1460,6 +1577,12 @@ class ReferenceDiscoveryService:
         reference_library: ReferenceClipLibrary | None = None,
         analyzer_factory: Callable[[ReferenceClipLibrary], Any] = ReferenceClipAnalyzer,
         reference_root: Path = DEFAULT_REFERENCE_ROOT,
+        profile_root: Path | None = None,
+        audit_ledger: ReferenceDecisionAuditLedger | None = None,
+        decision_lock_path: Path | None = None,
+        withdrawal_recovery_root: Path | None = None,
+        reviewer_name: str | None = None,
+        move_path: Callable[[Path, Path], None] = os.replace,
     ) -> None:
         self.api = api
         self.queue = queue
@@ -1467,6 +1590,26 @@ class ReferenceDiscoveryService:
         self.reference_library = reference_library or ReferenceClipLibrary()
         self.analyzer_factory = analyzer_factory
         self.reference_root = Path(reference_root)
+        self.profile_root = (
+            Path(profile_root)
+            if profile_root is not None
+            else self.reference_root.parent / "reference_profiles"
+        )
+        self.audit_ledger = audit_ledger or ReferenceDecisionAuditLedger(
+            self.queue.path.parent / DEFAULT_AUDIT_PATH.name
+        )
+        self.decision_lock_path = Path(
+            decision_lock_path
+            if decision_lock_path is not None
+            else self.queue.path.parent / DEFAULT_DECISION_LOCK.name
+        )
+        self.withdrawal_recovery_root = Path(
+            withdrawal_recovery_root
+            if withdrawal_recovery_root is not None
+            else self.queue.path.parent / DEFAULT_WITHDRAWAL_RECOVERY_ROOT.name
+        )
+        self.reviewer_name = configured_reviewer_name(reviewer_name)
+        self.move_path = move_path
 
     def discover(
         self, *, target_count: int | None = None, pool_size: int = 100,
@@ -1669,100 +1812,783 @@ class ReferenceDiscoveryService:
         self.queue.refresh_metadata(refreshed)
         return len(refreshed)
 
+    @contextmanager
+    def _decision_lock(self):
+        self.decision_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.decision_lock_path.open("a+", encoding="utf-8") as stream:
+            os.chmod(self.decision_lock_path, 0o600)
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def legal_actions(status: str) -> frozenset[str]:
+        try:
+            return LEGAL_ACTIONS[status]
+        except KeyError as error:
+            raise ReferenceDiscoveryError(
+                f"Unsupported candidate status {status!r}."
+            ) from error
+
+    @staticmethod
+    def _expected_revision(
+        candidate: Mapping[str, Any], expected_revision: int | None
+    ) -> int:
+        current = ReferenceCandidateQueue.revision(candidate)
+        if expected_revision is None:
+            return current
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ReferenceDiscoveryError("Expected candidate revision is invalid.")
+        if expected_revision != current:
+            raise ReferenceDiscoveryError(
+                f"Stale candidate form: expected revision {expected_revision}, "
+                f"current revision is {current}. Refresh and retry."
+            )
+        return current
+
+    @staticmethod
+    def _decision_note(
+        notes: str | None, *, required: bool
+    ) -> str:
+        if notes is None:
+            value = ""
+        elif not isinstance(notes, str):
+            raise ReferenceDiscoveryError("Reviewer note must be text.")
+        else:
+            value = notes.strip()
+        if len(value) > 4_000:
+            raise ReferenceDiscoveryError(
+                "Reviewer notes are limited to 4000 characters."
+            )
+        if required and not value:
+            raise ReferenceDiscoveryError(
+                "A meaningful reviewer note is required for this action."
+            )
+        return value
+
+    def _event(
+        self,
+        *,
+        candidate: Mapping[str, Any],
+        action: str,
+        requested_status: str,
+        resulting_status: str,
+        resulting_revision: int,
+        accepted_reference_id_after: str | None,
+        result: str,
+        note: str,
+        request_id: str | None,
+        failure_reason: str | None = None,
+        recovery_key: str | None = None,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.audit_ledger.event(
+            video_id=str(candidate["video_id"]),
+            action=action,
+            previous_status=str(candidate["status"]),
+            requested_status=requested_status,
+            resulting_status=resulting_status,
+            previous_revision=self.queue.revision(candidate),
+            resulting_revision=resulting_revision,
+            accepted_reference_id_before=candidate.get(
+                "accepted_reference_id"
+            ),
+            accepted_reference_id_after=accepted_reference_id_after,
+            result=result,
+            failure_reason=failure_reason,
+            reviewer=self.reviewer_name,
+            note=note,
+            request_id=request_id,
+            recovery_key=recovery_key,
+            event_id=event_id,
+        )
+
+    def _record_operational_failure(
+        self,
+        *,
+        candidate: Mapping[str, Any],
+        action: str,
+        requested_status: str,
+        note: str,
+        request_id: str | None,
+        error: Exception,
+    ) -> None:
+        if isinstance(error, ReferenceDecisionAuditError):
+            return
+        try:
+            self.audit_ledger.append(
+                self._event(
+                    candidate=candidate,
+                    action=action,
+                    requested_status=requested_status,
+                    resulting_status=str(candidate["status"]),
+                    resulting_revision=self.queue.revision(candidate),
+                    accepted_reference_id_after=candidate.get(
+                        "accepted_reference_id"
+                    ),
+                    result="failure",
+                    note=note,
+                    request_id=request_id,
+                    failure_reason=str(error),
+                )
+            )
+        except ReferenceDecisionAuditError:
+            pass
+
+    def _require_unused_request(self, request_id: str | None) -> None:
+        if request_id is None:
+            return
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
+            raise ReferenceDiscoveryError(
+                "Decision request ID is invalid; refresh and retry."
+            )
+        if any(
+            event.get("request_id") == request_id
+            for event in self.audit_ledger.history()
+        ):
+            raise ReferenceDiscoveryError(
+                "This decision request was already processed; refresh before "
+                "submitting another action."
+            )
+
+    def history(
+        self, video_id: str, *, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        self.queue.get(video_id)
+        return self.audit_ledger.history(video_id, limit=limit)
+
+    def transition(
+        self,
+        video_id: str,
+        action: str,
+        *,
+        notes: str | None,
+        expected_revision: int | None,
+        category: str | None = None,
+        topic: str | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        targets = {
+            "reject": "rejected",
+            "duplicate": "duplicate",
+            "reconsider": "discovered",
+        }
+        if action not in targets:
+            raise ReferenceDiscoveryError(
+                f"Unsupported reference decision action {action!r}."
+            )
+        note = self._decision_note(
+            notes, required=action in {"reject", "duplicate"}
+        )
+        target = targets[action]
+        with self._decision_lock():
+            self._require_unused_request(request_id)
+            candidate = self.queue.get(video_id)
+            revision = self._expected_revision(candidate, expected_revision)
+            if action not in self.legal_actions(candidate["status"]):
+                instruction = (
+                    " Use Withdraw Reference for an accepted candidate."
+                    if candidate["status"] == "accepted"
+                    else " Refresh the review page and use a legal action."
+                )
+                raise ReferenceDiscoveryError(
+                    f"Cannot {action} a {candidate['status']} candidate."
+                    + instruction
+                )
+            queue_snapshot = self.queue.snapshot()
+            try:
+                updated = self.queue.transition(
+                    video_id,
+                    expected_revision=revision,
+                    expected_status=candidate["status"],
+                    status=target,
+                    notes=(
+                        note
+                        if action != "reconsider" or note
+                        else None
+                    ),
+                    category=category,
+                    topic=topic,
+                )
+                self.audit_ledger.append(
+                    self._event(
+                        candidate=candidate,
+                        action=action,
+                        requested_status=target,
+                        resulting_status=updated["status"],
+                        resulting_revision=updated["revision"],
+                        accepted_reference_id_after=updated.get(
+                            "accepted_reference_id"
+                        ),
+                        result="success",
+                        note=note,
+                        request_id=request_id,
+                    )
+                )
+                return updated
+            except Exception as error:
+                self.queue.restore(queue_snapshot)
+                self._record_operational_failure(
+                    candidate=candidate,
+                    action=action,
+                    requested_status=target,
+                    note=note,
+                    request_id=request_id,
+                    error=error,
+                )
+                raise
+
     def accept(
         self, video_id: str, *, category: str, notes: str,
         transcription: bool = False, topic: str | None = None,
+        expected_revision: int | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
-        candidate = self.queue.get(video_id)
-        if candidate["status"] != "discovered":
-            raise ReferenceDiscoveryError("Only discovered candidates can be accepted.")
-        if topic is not None:
-            candidate["topic"] = topic
-            candidate["topic_manually_corrected"] = True
-        media_path = candidate.get("media_path")
-        if isinstance(media_path, str):
-            try:
-                resolved_media_path = self.queue.resolve_media_path(media_path)
-            except ReferenceDiscoveryError as error:
+        note = self._decision_note(notes, required=False)
+        with self._decision_lock():
+            self._require_unused_request(request_id)
+            candidate = self.queue.get(video_id)
+            revision = self._expected_revision(candidate, expected_revision)
+            if "accept" not in self.legal_actions(candidate["status"]):
                 raise ReferenceDiscoveryError(
-                    f"Candidate media is unavailable: {error}"
-                ) from error
-        else:
-            evidence = self.media_validator.validate(candidate, retain=True)
-            if not evidence.valid_short or not evidence.media_path:
-                raise ReferenceDiscoveryError(
-                    f"Candidate media could not be validated: {evidence.error or 'invalid media'}."
+                    f"Cannot accept a {candidate['status']} candidate. "
+                    "Only discovered candidates can be accepted."
                 )
-            resolved_media_path = Path(evidence.media_path)
-        reference_id = f"youtube-{video_id}"
-        directory = self.reference_root / f"discovered-{video_id}"
-        directory.mkdir(parents=True, exist_ok=True)
-        target_media = directory / "reference.mp4"
-        if resolved_media_path.resolve() != target_media.resolve():
-            _copy_atomic(resolved_media_path, target_media)
-        baseline = {
-            "version": 1, "reference_id": reference_id,
-            "source_video_id": video_id, "source_title": candidate["title"],
-            "creator": candidate["creator"], "status": "accepted",
-            "purpose": "creatorflow_baseline", "profile_name": category,
-            "qualities": ["human-accepted discovered benchmark candidate"],
-            "layout": {
-                "orientation": "vertical", "composition": "unknown",
-                "top_region": "unknown", "bottom_region": "unknown",
-                "facecam_prominence": "unknown",
-            },
-            "story_structure": {
-                "opening_style": "unknown", "setup_requirement": "unknown",
-                "primary_focus": "unknown", "payoff_type": "unknown",
-                "payoff_required": False, "ending_style": "unknown",
-            },
-            "timing_preferences": {
-                "requires_long_lead_in": False,
-                "requires_complete_setup": False,
-                "requires_complete_payoff": False,
-                "preferred_ending": "human review required",
-            },
-            "notes": notes or "Accepted from automatic YouTube benchmark discovery.",
-        }
-        baseline_path = directory / "baseline.json"
-        source_path = directory / "reference.info.json"
-        _atomic_json(baseline_path, baseline)
-        _atomic_json(
-            source_path,
-            {
-                "origin": "automatic_youtube_discovery",
-                "metadata_snapshot": candidate,
-            },
-        )
-        registered = False
-        try:
-            entry = self.reference_library.register(
-                media_path=target_media, baseline_path=baseline_path,
-                source_info_path=source_path, reference_id=reference_id,
-                profile_name=category,
-            )
-            registered = True
-            self.analyzer_factory(self.reference_library).analyze(
-                reference_id, transcription=transcription
-            )
-        except Exception:
-            if registered:
-                self.reference_library.remove(reference_id)
-            for path in (
-                directory / "analysis.json", source_path, baseline_path, target_media
-            ):
-                path.unlink(missing_ok=True)
+            if topic is not None:
+                candidate["topic"] = topic
+                candidate["topic_manually_corrected"] = True
+            media_path = candidate.get("media_path")
+            if isinstance(media_path, str):
+                try:
+                    resolved_media_path = self.queue.resolve_media_path(
+                        media_path
+                    )
+                except ReferenceDiscoveryError as error:
+                    raise ReferenceDiscoveryError(
+                        f"Candidate media is unavailable: {error}"
+                    ) from error
+            else:
+                evidence = self.media_validator.validate(candidate, retain=True)
+                if not evidence.valid_short or not evidence.media_path:
+                    raise ReferenceDiscoveryError(
+                        "Candidate media could not be validated: "
+                        f"{evidence.error or 'invalid media'}."
+                    )
+                resolved_media_path = Path(evidence.media_path)
+            reference_id = f"youtube-{video_id}"
+            directory = self.reference_root / f"discovered-{video_id}"
+            if directory.exists():
+                raise ReferenceDiscoveryError(
+                    f"Accepted-reference directory already exists for {video_id}; "
+                    "inspect it before retrying."
+                )
+            queue_snapshot = self.queue.snapshot()
+            index_existed = self.reference_library.index_path.exists()
+            index_snapshot = self.reference_library.snapshot_index()
+            directory.mkdir(parents=True)
+            target_media = directory / "reference.mp4"
+            baseline_path = directory / "baseline.json"
+            source_path = directory / "reference.info.json"
             try:
-                directory.rmdir()
-            except OSError:
-                pass
-            raise
-        self.queue.decide(
-            video_id, "accepted", notes=notes, category=category,
-            topic=topic,
-            accepted_reference_id=reference_id,
+                if resolved_media_path.resolve() != target_media.resolve():
+                    _copy_atomic(resolved_media_path, target_media)
+                baseline = {
+                    "version": 1, "reference_id": reference_id,
+                    "source_video_id": video_id,
+                    "source_title": candidate["title"],
+                    "creator": candidate["creator"], "status": "accepted",
+                    "purpose": "creatorflow_baseline",
+                    "profile_name": category,
+                    "qualities": [
+                        "human-accepted discovered benchmark candidate"
+                    ],
+                    "layout": {
+                        "orientation": "vertical", "composition": "unknown",
+                        "top_region": "unknown", "bottom_region": "unknown",
+                        "facecam_prominence": "unknown",
+                    },
+                    "story_structure": {
+                        "opening_style": "unknown",
+                        "setup_requirement": "unknown",
+                        "primary_focus": "unknown",
+                        "payoff_type": "unknown",
+                        "payoff_required": False,
+                        "ending_style": "unknown",
+                    },
+                    "timing_preferences": {
+                        "requires_long_lead_in": False,
+                        "requires_complete_setup": False,
+                        "requires_complete_payoff": False,
+                        "preferred_ending": "human review required",
+                    },
+                    "notes": note or (
+                        "Accepted from automatic YouTube benchmark discovery."
+                    ),
+                }
+                _atomic_json(baseline_path, baseline)
+                _atomic_json(
+                    source_path,
+                    {
+                        "origin": "automatic_youtube_discovery",
+                        "metadata_snapshot": candidate,
+                    },
+                )
+                entry = self.reference_library.register(
+                    media_path=target_media,
+                    baseline_path=baseline_path,
+                    source_info_path=source_path,
+                    reference_id=reference_id,
+                    profile_name=category,
+                )
+                self.analyzer_factory(self.reference_library).analyze(
+                    reference_id, transcription=transcription
+                )
+                updated = self.queue.transition(
+                    video_id,
+                    expected_revision=revision,
+                    expected_status="discovered",
+                    status="accepted",
+                    notes=note if note else None,
+                    category=category,
+                    topic=topic,
+                    accepted_reference_id=reference_id,
+                )
+                self.audit_ledger.append(
+                    self._event(
+                        candidate=candidate,
+                        action="accept",
+                        requested_status="accepted",
+                        resulting_status="accepted",
+                        resulting_revision=updated["revision"],
+                        accepted_reference_id_after=reference_id,
+                        result="success",
+                        note=note,
+                        request_id=request_id,
+                    )
+                )
+                return entry
+            except Exception as error:
+                self.queue.restore(queue_snapshot)
+                if index_existed:
+                    self.reference_library.restore_index(index_snapshot)
+                else:
+                    self.reference_library.index_path.unlink(missing_ok=True)
+                for path in (
+                    directory / "analysis.json",
+                    source_path,
+                    baseline_path,
+                    target_media,
+                ):
+                    path.unlink(missing_ok=True)
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+                self._record_operational_failure(
+                    candidate=candidate,
+                    action="accept",
+                    requested_status="accepted",
+                    note=note,
+                    request_id=request_id,
+                    error=error,
+                )
+                raise
+
+    def _profiles_using(self, reference_id: str) -> list[Path]:
+        profiles = []
+        if not self.profile_root.exists():
+            return profiles
+        for path in sorted(self.profile_root.glob("*.json")):
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ReferenceDiscoveryError(
+                    f"Cannot verify profile {path}: {error}."
+                ) from error
+            ids = document.get("reference_ids")
+            if not isinstance(ids, list) or not all(
+                isinstance(value, str) for value in ids
+            ):
+                raise ReferenceDiscoveryError(
+                    f"Cannot verify malformed reference profile {path}."
+                )
+            if reference_id in ids:
+                profiles.append(path)
+        return profiles
+
+    def _withdrawal_artifacts(
+        self, candidate: Mapping[str, Any]
+    ) -> tuple[str, dict[str, Any], Path]:
+        video_id = str(candidate["video_id"])
+        expected_reference_id = f"youtube-{video_id}"
+        reference_id = candidate.get("accepted_reference_id")
+        if reference_id != expected_reference_id:
+            raise ReferenceDiscoveryError(
+                f"Candidate {video_id} does not own expected reference "
+                f"{expected_reference_id}; withdrawal was refused."
+            )
+        try:
+            entry = self.reference_library.get(reference_id)
+        except ReferenceClipError as error:
+            raise ReferenceDiscoveryError(
+                f"Accepted reference {reference_id} is missing from the strict "
+                "index; repair the inconsistency before withdrawal."
+            ) from error
+        if entry["profile_name"] != candidate.get("category"):
+            raise ReferenceDiscoveryError(
+                f"Candidate category {candidate.get('category')!r} does not "
+                f"match indexed profile {entry['profile_name']!r}."
+            )
+        logical_directory = (
+            self.reference_root / f"discovered-{video_id}"
         )
-        return entry
+        reference_root = self.reference_root.resolve()
+        if logical_directory.is_symlink():
+            raise ReferenceDiscoveryError(
+                f"Reference {reference_id} directory is a symbolic link; "
+                "withdrawal was refused."
+            )
+        directory = logical_directory.resolve()
+        if directory.parent != reference_root:
+            raise ReferenceDiscoveryError(
+                f"Reference {reference_id} directory is outside the configured "
+                "reference root; withdrawal was refused."
+            )
+        expected_directory = Path(entry["media_path"]).resolve().parent
+        if expected_directory != directory:
+            raise ReferenceDiscoveryError(
+                f"Reference {reference_id} is not stored in its expected "
+                "discovered-candidate directory; withdrawal was refused."
+            )
+        expected_artifacts = {
+            "media_path": directory / "reference.mp4",
+            "baseline_path": directory / "baseline.json",
+            "analysis_path": directory / "analysis.json",
+            "source_info_path": directory / "reference.info.json",
+        }
+        paths = {
+            name: Path(entry[name]).resolve()
+            for name in expected_artifacts
+            if entry.get(name)
+        }
+        if set(paths) != set(expected_artifacts) or any(
+            path != expected_artifacts[name]
+            or path.parent != directory
+            or not path.is_file()
+            for name, path in paths.items()
+        ):
+            raise ReferenceDiscoveryError(
+                f"Reference {reference_id} has missing or unexpected artifacts; "
+                "withdrawal was refused."
+            )
+        baseline = load_and_validate_baseline(Path(entry["baseline_path"]))
+        if (
+            baseline["reference_id"] != reference_id
+            or baseline.get("source_video_id") != video_id
+            or baseline["profile_name"] != entry["profile_name"]
+        ):
+            raise ReferenceDiscoveryError(
+                f"Reference {reference_id} does not belong to candidate "
+                f"{video_id}; withdrawal was refused."
+            )
+        try:
+            self.reference_library.validate_checksum(reference_id)
+        except ReferenceClipError as error:
+            raise ReferenceDiscoveryError(
+                f"Reference checksum validation failed: {error}"
+            ) from error
+        media_value = candidate.get("media_path")
+        if not isinstance(media_value, str):
+            raise ReferenceDiscoveryError(
+                "Retained discovery media is unavailable; withdrawal was refused."
+            )
+        retained_media = self.queue.resolve_media_path(media_value)
+        if retained_media.resolve() == Path(entry["media_path"]).resolve():
+            raise ReferenceDiscoveryError(
+                "Accepted media and retained discovery media unexpectedly share "
+                "one file; withdrawal was refused."
+            )
+        profiles = self._profiles_using(reference_id)
+        if profiles:
+            names = ", ".join(path.stem for path in profiles)
+            raise ReferenceDiscoveryError(
+                f"Reference {reference_id} is used by profile(s) {names}. "
+                "Rebuild those profiles explicitly before withdrawing it."
+            )
+        return reference_id, entry, directory
+
+    def withdraw(
+        self,
+        video_id: str,
+        *,
+        status: str = "rejected",
+        notes: str,
+        expected_revision: int | None = None,
+        confirmed: bool = False,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        if status != "rejected":
+            raise ReferenceDiscoveryError(
+                "Withdrawal currently supports only accepted → rejected."
+            )
+        if not confirmed:
+            raise ReferenceDiscoveryError(
+                "Withdrawal confirmation is required."
+            )
+        note = self._decision_note(notes, required=True)
+        with self._decision_lock():
+            self._require_unused_request(request_id)
+            candidate = self.queue.get(video_id)
+            revision = self._expected_revision(candidate, expected_revision)
+            repair_inconsistency = (
+                candidate["status"] == "rejected"
+                and candidate.get("accepted_reference_id") is not None
+            )
+            if (
+                "withdraw" not in self.legal_actions(candidate["status"])
+                and not repair_inconsistency
+            ):
+                raise ReferenceDiscoveryError(
+                    f"Cannot withdraw a {candidate['status']} candidate. "
+                    "Refresh and use a legal action."
+                )
+            reference_id, _entry, directory = self._withdrawal_artifacts(
+                candidate
+            )
+            event_id = uuid.uuid4().hex
+            recovery_key = (
+                Path("withdrawal_recovery")
+                / event_id
+                / directory.name
+            ).as_posix()
+            recovery_directory = (
+                self.withdrawal_recovery_root / event_id / directory.name
+            )
+            if recovery_directory.exists():
+                raise ReferenceDiscoveryError(
+                    "Withdrawal recovery destination already exists."
+                )
+            queue_snapshot = self.queue.snapshot()
+            index_snapshot = self.reference_library.snapshot_index()
+            moved = False
+            index_changed = False
+            try:
+                recovery_directory.parent.mkdir(parents=True, exist_ok=False)
+                self.move_path(directory, recovery_directory)
+                moved = True
+                self.reference_library.remove(reference_id)
+                index_changed = True
+                updated = self.queue.transition(
+                    video_id,
+                    expected_revision=revision,
+                    expected_status=candidate["status"],
+                    status=status,
+                    notes=note,
+                    clear_accepted_reference=True,
+                )
+                self.audit_ledger.append(
+                    self._event(
+                        candidate=candidate,
+                        action="withdraw",
+                        requested_status=status,
+                        resulting_status=updated["status"],
+                        resulting_revision=updated["revision"],
+                        accepted_reference_id_after=None,
+                        result="success",
+                        note=note,
+                        request_id=request_id,
+                        recovery_key=recovery_key,
+                        event_id=event_id,
+                    )
+                )
+                return {
+                    "candidate": updated,
+                    "withdrawn_reference_id": reference_id,
+                    "recovery_key": recovery_key,
+                }
+            except Exception as error:
+                rollback_errors = []
+                try:
+                    self.queue.restore(queue_snapshot)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"queue restore failed: {rollback_error}")
+                if moved and recovery_directory.exists():
+                    try:
+                        directory.parent.mkdir(parents=True, exist_ok=True)
+                        self.move_path(recovery_directory, directory)
+                    except Exception as rollback_error:
+                        rollback_errors.append(
+                            f"artifact restore failed: {rollback_error}"
+                        )
+                if index_changed:
+                    try:
+                        self.reference_library.restore_index(index_snapshot)
+                    except Exception as rollback_error:
+                        rollback_errors.append(
+                            f"index restore failed: {rollback_error}"
+                        )
+                try:
+                    recovery_directory.parent.rmdir()
+                except OSError:
+                    pass
+                self._record_operational_failure(
+                    candidate=candidate,
+                    action="withdraw",
+                    requested_status=status,
+                    note=note,
+                    request_id=request_id,
+                    error=error,
+                )
+                if rollback_errors:
+                    raise ReferenceDiscoveryError(
+                        f"Withdrawal failed ({error}); rollback was incomplete: "
+                        + "; ".join(rollback_errors)
+                    ) from error
+                raise
+
+    def consistency_problems(self) -> list[str]:
+        candidates = self.queue.list()
+        entries = {
+            entry["reference_id"]: entry
+            for entry in self.reference_library.list_references()
+        }
+        candidate_by_id = {
+            candidate["video_id"]: candidate for candidate in candidates
+        }
+        profile_inputs: dict[str, list[str]] = {}
+        if self.profile_root.exists():
+            for path in sorted(self.profile_root.glob("*.json")):
+                try:
+                    profile = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    profile_inputs[path.stem] = [
+                        f"<malformed:{type(error).__name__}>"
+                    ]
+                    continue
+                values = profile.get("reference_ids")
+                profile_inputs[path.stem] = (
+                    values if isinstance(values, list) else ["<malformed>"]
+                )
+        problems = []
+        for candidate in candidates:
+            video_id = candidate["video_id"]
+            expected = f"youtube-{video_id}"
+            reference_id = candidate.get("accepted_reference_id")
+            status = candidate["status"]
+            if status != "accepted":
+                for profile_name, ids in profile_inputs.items():
+                    if expected in ids:
+                        problems.append(
+                            f"{video_id}: non-accepted reference {expected} "
+                            f"remains in profile {profile_name}; rebuild the "
+                            "profile explicitly."
+                        )
+            if status in {"rejected", "duplicate"} and reference_id is not None:
+                problems.append(
+                    f"{video_id}: {status} candidate retains "
+                    f"accepted_reference_id {reference_id}; use the dedicated "
+                    "withdrawal repair workflow."
+                )
+            if status == "accepted" and reference_id is None:
+                problems.append(
+                    f"{video_id}: accepted candidate has no accepted_reference_id."
+                )
+                continue
+            if reference_id is None:
+                continue
+            if reference_id != expected:
+                problems.append(
+                    f"{video_id}: accepted_reference_id {reference_id} does "
+                    f"not match owned reference {expected}."
+                )
+            entry = entries.get(reference_id)
+            if entry is None:
+                problems.append(
+                    f"{video_id}: accepted_reference_id {reference_id} is "
+                    "missing from the strict reference index."
+                )
+                continue
+            if entry["profile_name"] != candidate.get("category"):
+                problems.append(
+                    f"{video_id}: candidate category "
+                    f"{candidate.get('category')!r} does not match indexed "
+                    f"profile {entry['profile_name']!r}."
+                )
+            try:
+                self.reference_library.validate_checksum(reference_id)
+            except ReferenceClipError as error:
+                problems.append(
+                    f"{video_id}: accepted reference checksum is invalid: "
+                    f"{error}"
+                )
+            try:
+                baseline = load_and_validate_baseline(
+                    Path(entry["baseline_path"])
+                )
+                if (
+                    baseline["reference_id"] != reference_id
+                    or baseline.get("source_video_id") != video_id
+                ):
+                    problems.append(
+                        f"{video_id}: indexed reference ownership metadata "
+                        "does not match the candidate."
+                    )
+            except (ReferenceClipError, OSError) as error:
+                problems.append(
+                    f"{video_id}: reference annotations are invalid: {error}"
+                )
+        for reference_id, entry in entries.items():
+            baseline_path = Path(entry["baseline_path"])
+            try:
+                baseline = load_and_validate_baseline(baseline_path)
+            except (ReferenceClipError, OSError):
+                continue
+            video_id = baseline.get("source_video_id")
+            candidate = candidate_by_id.get(video_id)
+            if (
+                baseline_path.parent.name.startswith("discovered-")
+                and candidate is None
+            ):
+                problems.append(
+                    f"{video_id}: strict index lists discovered reference "
+                    f"{reference_id}, but its candidate queue record is missing."
+                )
+            elif (
+                baseline_path.parent.name.startswith("discovered-")
+                and candidate is not None
+                and (
+                    candidate["status"] != "accepted"
+                    or candidate.get("accepted_reference_id") != reference_id
+                )
+            ):
+                problems.append(
+                    f"{video_id}: strict index still lists {reference_id} "
+                    f"while candidate status is {candidate['status']}; use "
+                    "the dedicated withdrawal repair workflow."
+                )
+        return problems
+
+    def validate_consistency(self) -> dict[str, Any]:
+        self.queue.validate_media_paths(require_canonical=True)
+        problems = self.consistency_problems()
+        if problems:
+            raise ReferenceDiscoveryError(
+                "Reference decision consistency validation failed: "
+                + " ".join(problems)
+            )
+        return {
+            "candidate_count": len(self.queue.list()),
+            "reference_count": len(
+                self.reference_library.list_references()
+            ),
+            "status": "valid",
+        }
 
 
 def _copy_atomic(source: Path, destination: Path) -> None:
@@ -1798,6 +2624,10 @@ def build_parser() -> argparse.ArgumentParser:
             "media paths. By default it is inferred from --queue-path."
         ),
     )
+    parser.add_argument("--reference-root", type=Path, default=DEFAULT_REFERENCE_ROOT)
+    parser.add_argument("--reference-index", type=Path)
+    parser.add_argument("--profile-directory", type=Path, default=DEFAULT_PROFILE_ROOT)
+    parser.add_argument("--audit-path", type=Path)
     sub = parser.add_subparsers(dest="command", required=True)
     discover = sub.add_parser("discover")
     discover.add_argument("--dry-run", action="store_true")
@@ -1821,6 +2651,14 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("video_id")
     sub.add_parser("refresh-stats")
     sub.add_parser("validate")
+    history = sub.add_parser("history")
+    history.add_argument("video_id")
+    history.add_argument("--limit", type=int)
+    withdraw = sub.add_parser("withdraw")
+    withdraw.add_argument("video_id")
+    withdraw.add_argument("--status", choices=("rejected",), default="rejected")
+    withdraw.add_argument("--note", required=True)
+    withdraw.add_argument("--expected-revision", type=int)
     migrate = sub.add_parser("migrate-media-paths")
     migrate.add_argument("--dry-run", action="store_true")
     return parser
@@ -1868,14 +2706,65 @@ def main(argv: Sequence[str] | None = ()) -> int:
         elif args.command == "refresh-stats":
             service = ReferenceDiscoveryService(YouTubeDataAPI(), queue)
             print(f"Refreshed {service.refresh_stats()} candidate(s).")
+        elif args.command in {"history", "withdraw", "validate"}:
+            library = ReferenceClipLibrary(
+                args.reference_root,
+                args.reference_index
+                if args.reference_index is not None
+                else args.reference_root / "index.json",
+            )
+            ledger = ReferenceDecisionAuditLedger(
+                args.audit_path
+                if args.audit_path is not None
+                else queue.path.parent / DEFAULT_AUDIT_PATH.name
+            )
+            service = ReferenceDiscoveryService(
+                YouTubeDataAPI(),
+                queue,
+                reference_library=library,
+                reference_root=args.reference_root,
+                profile_root=args.profile_directory,
+                audit_ledger=ledger,
+            )
+            if args.command == "history":
+                events = service.history(args.video_id, limit=args.limit)
+                print(json.dumps(events, indent=2, sort_keys=True))
+                print(f"{len(events)} decision event(s).")
+            elif args.command == "withdraw":
+                result = service.withdraw(
+                    args.video_id,
+                    status=args.status,
+                    notes=args.note,
+                    expected_revision=args.expected_revision,
+                    confirmed=True,
+                    request_id=uuid.uuid4().hex,
+                )
+                print(
+                    f"Withdrew {result['withdrawn_reference_id']}; "
+                    f"candidate is {result['candidate']['status']} at revision "
+                    f"{result['candidate']['revision']}."
+                )
+                print(f"Recovery key: {result['recovery_key']}")
+            else:
+                result = service.validate_consistency()
+                print(
+                    "Reference candidate queue and strict index are consistent: "
+                    f"{result['candidate_count']} candidate(s), "
+                    f"{result['reference_count']} reference(s)."
+                )
         elif args.command == "migrate-media-paths":
             result = queue.migrate_media_paths(dry_run=args.dry_run)
             print(json.dumps(result, indent=2, sort_keys=True))
         else:
-            items = queue.list()
-            queue.validate_media_paths(require_canonical=True)
-            print(f"Reference candidate queue is valid: {len(items)} item(s).")
-    except (ReferenceDiscoveryError, ValueError) as error:
+            raise ReferenceDiscoveryError(
+                f"Unsupported command {args.command!r}."
+            )
+    except (
+        ReferenceClipError,
+        ReferenceDecisionAuditError,
+        ReferenceDiscoveryError,
+        ValueError,
+    ) as error:
         print(f"Reference discovery failed: {error}", file=sys.stderr)
         return 1
     return 0
