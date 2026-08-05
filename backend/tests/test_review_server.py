@@ -234,6 +234,155 @@ def test_failed_reference_comparison_preserves_review_state(tmp_path):
     assert before == after
 
 
+class FakeTikTokPublications:
+    def __init__(self):
+        self.calls = []
+        self.attempt = None
+
+    def connection(self):
+        return {
+            "enabled": True, "connected": True,
+            "account": {"open_id": "account", "display_name": "Safe Account"},
+        }
+
+    def review_context(self, item):
+        return {
+            **self.connection(), "attempt": self.attempt,
+            "checksum": "a" * 64, "source_creator": "Creator",
+            "cleanup_eligible": False,
+        }
+
+    def prepare(self, review_id, **kwargs):
+        self.calls.append(("prepare", review_id, kwargs))
+        self.attempt = {
+            "attempt_id": "publication_" + "a" * 24,
+            "state": "awaiting_consent", "updated_at": "2026-08-01T00:00:00Z",
+            "caption": kwargs["caption"],
+            "source_attribution": kwargs["source_attribution"],
+            "rendered_media_sha256": "a" * 64, "remote_publish_id": None,
+            "error_reason": None, "stale": False,
+        }
+        return self.attempt
+
+    def send(self, attempt_id, *, confirmed):
+        self.calls.append(("send", attempt_id, confirmed))
+        if not confirmed:
+            raise ValueError("confirmation required")
+        return {**self.attempt, "state": "processing"}
+
+    def refresh(self, attempt_id):
+        self.calls.append(("refresh", attempt_id))
+        return {**self.attempt, "state": "awaiting_creator_post"}
+
+    def cancel(self, attempt_id):
+        self.calls.append(("cancel", attempt_id))
+        return {**self.attempt, "state": "cancelled"}
+
+    def retry(self, attempt_id):
+        self.calls.append(("retry", attempt_id))
+        return {**self.attempt, "state": "processing"}
+
+    def mark_review_stale(self, review_id):
+        self.calls.append(("stale", review_id))
+        return 1
+
+    def authorization_url(self):
+        self.calls.append(("connect",))
+        return "https://www.tiktok.com/v2/auth/authorize/?state=opaque"
+
+    def disconnect(self):
+        self.calls.append(("disconnect",))
+
+    def complete_oauth(self, **kwargs):
+        self.calls.append(("oauth", kwargs))
+        return {"display_name": "Safe Account"}
+
+
+def test_approved_review_shows_consent_driven_tiktok_controls(tmp_path):
+    with running_server(tmp_path) as (server, queue, _):
+        rid = review_id(queue)
+        queue.approve(rid)
+        publisher = FakeTikTokPublications()
+        server.app.tiktok_publications = publisher
+        status, _, body = request(server, "GET", "/")
+    text = body.decode()
+    assert status == 200
+    for value in (
+        "Safe Account", "Final-render SHA-256", "Prepare only — no upload",
+        "authorized to republish", "Inbox delivery is not a public post",
+    ):
+        assert value in text
+    assert publisher.calls == []
+
+
+def test_prepare_and_send_are_separate_token_protected_posts(tmp_path):
+    with running_server(tmp_path) as (server, queue, _):
+        rid = review_id(queue)
+        queue.approve(rid)
+        publisher = FakeTikTokPublications()
+        server.app.tiktok_publications = publisher
+        denied, _, _ = post(
+            server, f"/reviews/{rid}/tiktok-prepare",
+            {"caption": "Caption", "source_attribution": "Source",
+             "rights_confirmed": "yes"},
+        )
+        prepared, _, _ = post(
+            server, f"/reviews/{rid}/tiktok-prepare",
+            {"form_token": "test-token", "caption": "Caption #tag",
+             "source_attribution": "Source: Creator", "rights_confirmed": "yes"},
+        )
+        _, _, confirmation = request(server, "GET", "/")
+        sent, _, _ = post(
+            server, f"/reviews/{rid}/tiktok-send",
+            {"form_token": "test-token", "attempt_id": publisher.attempt["attempt_id"],
+             "confirm_upload": "yes"},
+        )
+    assert denied == 403 and prepared == 303 and sent == 303
+    text = confirmation.decode()
+    assert "Immediate upload confirmation" in text
+    assert "Safe Account" in text and "Caption #tag" in text
+    assert [call[0] for call in publisher.calls] == ["prepare", "send"]
+
+
+def test_timing_change_marks_prepared_publication_stale(tmp_path):
+    with running_server(tmp_path) as (server, queue, _):
+        rid = review_id(queue)
+        queue.approve(rid)
+        publisher = FakeTikTokPublications()
+        server.app.tiktok_publications = publisher
+        status, _, _ = post(
+            server, f"/reviews/{rid}/adjust",
+            {"form_token": "test-token", "render_start": "9", "render_end": "21",
+             "maximum_duration": "60"},
+        )
+    assert status == 303
+    assert ("stale", rid) in publisher.calls
+
+
+def test_tiktok_connect_disconnect_and_oauth_completion_use_post(tmp_path):
+    with running_server(tmp_path) as (server, _, _):
+        publisher = FakeTikTokPublications()
+        server.app.tiktok_publications = publisher
+        get_status, _, _ = request(server, "GET", "/tiktok/connect")
+        connected, headers, _ = post(
+            server, "/tiktok/connect", {"form_token": "test-token"}
+        )
+        callback, _, body = request(
+            server, "GET", "/tiktok/oauth/callback?code=opaque-code&state=opaque-state"
+        )
+        completed, _, _ = post(
+            server, "/tiktok/oauth/complete",
+            {"form_token": "test-token", "code": "opaque-code", "state": "opaque-state"},
+        )
+        disconnected, _, _ = post(
+            server, "/tiktok/disconnect", {"form_token": "test-token"}
+        )
+    assert get_status in {404, 405}
+    assert connected == 303 and headers["Location"].startswith("https://www.tiktok.com/")
+    assert callback == 200 and b"Complete TikTok connection" in body
+    assert completed == disconnected == 303
+
+
 class FakeReferenceDiscovery:
     def __init__(self, queue):
         self.queue = queue

@@ -1,0 +1,9 @@
+{
+  "source_media_retention_days": 7,
+  "rejected_preview_retention_days": 14,
+  "published_media_retention_days": 30,
+  "quarantine_retention_days": 7,
+  "retain_metadata": true,
+  "retain_transcripts": true,
+  "retain_audits": true
+}

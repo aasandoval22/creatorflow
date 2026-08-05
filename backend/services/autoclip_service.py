@@ -33,6 +33,9 @@ PRODUCTION_SERVICE = "creatorflow-production.service"
 PRODUCTION_TIMER = "creatorflow-production.timer"
 REVIEW_SERVICE = "creatorflow-review.service"
 MANAGED_UNITS = (PRODUCTION_SERVICE, PRODUCTION_TIMER, REVIEW_SERVICE)
+CLEANUP_SERVICE = "creatorflow-cleanup.service"
+CLEANUP_TIMER = "creatorflow-cleanup.timer"
+OPTIONAL_CLEANUP_UNITS = (CLEANUP_SERVICE, CLEANUP_TIMER)
 DEFAULT_INTERVAL = "30m"
 INTERVAL_PATTERN = re.compile(r"^[1-9][0-9]*(?:s|min|m|h|d|w)$")
 
@@ -196,6 +199,35 @@ class AutoClipServiceManager:
             "linger": self.lingering(),
         }
 
+    def install_cleanup(self) -> dict[str, Any]:
+        """Install optional cleanup units without enabling or starting them."""
+
+        self.check_support()
+        replacements = {
+            "project_root": _escape_systemd_path(self.project_root),
+            "python_path": _escape_systemd_path(self.python_path),
+            "environment_file": _escape_systemd_path(self.environment_file),
+        }
+        changed = []
+        for unit in OPTIONAL_CLEANUP_UNITS:
+            template_path = self.template_directory / f"{unit}.in"
+            try:
+                content = template_path.read_text(encoding="utf-8").format(
+                    **replacements
+                )
+            except OSError as error:
+                raise ServiceManagerError(
+                    f"Cannot read optional unit template {template_path}: {error}."
+                ) from error
+            if _atomic_write(self.unit_directory / unit, content):
+                changed.append(unit)
+        self._require_success(("systemctl", "--user", "daemon-reload"))
+        return {
+            "changed_units": changed,
+            "enabled": False,
+            "unit_directory": str(self.unit_directory),
+        }
+
     def _deployment_status(self) -> dict[str, Any]:
         return ProductionDeployer(
             development_root=DEFAULT_DEVELOPMENT_ROOT,
@@ -267,6 +299,10 @@ class AutoClipServiceManager:
         timer = self._unit_status(PRODUCTION_TIMER)
         production = self._unit_status(PRODUCTION_SERVICE)
         history = _production_history(Path(log_path))
+        cleanup_installed = all(
+            (self.unit_directory / unit).is_file()
+            for unit in OPTIONAL_CLEANUP_UNITS
+        )
         return {
             "review_server": review,
             "production_timer": timer,
@@ -279,6 +315,11 @@ class AutoClipServiceManager:
             "awaiting_review": _pending_review_count(Path(review_queue_path)),
             "linger": self.lingering(),
             "deployment": self._deployment_status(),
+            "cleanup_timer": (
+                self._unit_status(CLEANUP_TIMER) if cleanup_installed
+                else {"active": "not-installed", "enabled": "disabled"}
+            ),
+            "cleanup": _cleanup_history(self.project_root / "data" / "media_cleanup"),
         }
 
     def _next_timer_run(self) -> str | None:
@@ -392,6 +433,33 @@ def _pending_review_count(path: Path) -> int | None:
     )
 
 
+def _cleanup_history(root: Path) -> dict[str, Any]:
+    quarantine_root = Path(root) / "quarantine"
+    manifests = []
+    if quarantine_root.is_dir():
+        for path in quarantine_root.glob("quarantine_*/manifest.json"):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict) and value.get("version") == 1:
+                manifests.append(value)
+    active = [item for item in manifests if item.get("state") == "quarantined"]
+    return {
+        "quarantine_count": len(active),
+        "quarantined_bytes": sum(
+            item.get("quarantined_bytes", 0)
+            for item in active
+            if isinstance(item.get("quarantined_bytes"), int)
+        ),
+        "latest_quarantine": max(
+            (item.get("updated_at") for item in manifests
+             if isinstance(item.get("updated_at"), str)),
+            default=None,
+        ),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Manage CreatorFlow systemd user automation."
@@ -399,6 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     install = commands.add_parser("install")
     install.add_argument("--interval", type=validate_interval, default=DEFAULT_INTERVAL)
+    commands.add_parser("install-cleanup")
     for name in ("start", "stop", "restart", "status", "run-now", "disable"):
         commands.add_parser(name)
     deploy = commands.add_parser("deploy")
@@ -425,6 +494,19 @@ def _print_status(status: Mapping[str, Any], stream: TextIO) -> None:
     pending = status["awaiting_review"]
     print(f"Awaiting review: {pending if pending is not None else 'unavailable'}", file=stream)
     print(f"User lingering: {status['linger']}", file=stream)
+    cleanup_timer = status.get("cleanup_timer") or {}
+    cleanup = status.get("cleanup") or {}
+    print(
+        "Cleanup timer: "
+        f"{cleanup_timer.get('active', 'not-installed')} "
+        f"(enabled={cleanup_timer.get('enabled', 'disabled')})",
+        file=stream,
+    )
+    print(
+        f"Quarantined media: {cleanup.get('quarantine_count', 0)} items, "
+        f"{cleanup.get('quarantined_bytes', 0)} bytes",
+        file=stream,
+    )
     deployment = status.get("deployment") or {}
     print(
         f"Deployed commit: {deployment.get('deployed_commit') or 'none'}",
@@ -465,6 +547,15 @@ def main(
                     f"administrator command: sudo loginctl enable-linger {user}",
                     file=stdout,
                 )
+        elif args.command == "install-cleanup":
+            result = manager.install_cleanup()
+            changed = ", ".join(result["changed_units"]) or "none (already current)"
+            print(f"Installed optional cleanup units: {changed}", file=stdout)
+            print(
+                "Cleanup timer remains disabled and stopped. Enabling it requires "
+                "a separate explicit post-merge operation.",
+                file=stdout,
+            )
         elif args.command == "start":
             manager.start()
             print("Review server and production timer started.", file=stdout)

@@ -1,0 +1,11 @@
+[Unit]
+Description=Plan and quarantine eligible CreatorFlow media
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=2h
+Unit=creatorflow-cleanup.service
+
+[Install]
+WantedBy=timers.target

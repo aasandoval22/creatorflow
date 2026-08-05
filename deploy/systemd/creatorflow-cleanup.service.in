@@ -1,0 +1,12 @@
+[Unit]
+Description=CreatorFlow eligible-media quarantine cycle
+After=creatorflow-production.service
+
+[Service]
+Type=oneshot
+WorkingDirectory={project_root}
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-{environment_file}
+ExecStart={python_path} -m backend.app.media_cleanup run-eligible --execute
+TimeoutStopSec=120
+KillSignal=SIGINT
