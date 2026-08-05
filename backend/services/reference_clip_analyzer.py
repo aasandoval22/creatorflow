@@ -85,7 +85,7 @@ class ReferenceClipAnalyzer:
         self, reference_id: str, *, transcription: bool = True, force: bool = False
     ) -> dict[str, Any]:
         entry = self.library.get(reference_id)
-        output_path = Path(entry["analysis_path"])
+        output_path = self.library.paths.resolve(entry["analysis_path"])
         existing: dict[str, Any] | None = None
         if output_path.is_file() and not force:
             try:
@@ -106,8 +106,14 @@ class ReferenceClipAnalyzer:
                 existing = None
         try:
             self.library.validate_checksum(reference_id)
-            media_path = Path(entry["media_path"])
-            baseline = load_and_validate_baseline(Path(entry["baseline_path"]))
+            media_path = self.library.paths.resolve(
+                entry["media_path"], must_exist=True, regular=True
+            )
+            baseline = load_and_validate_baseline(
+                self.library.paths.resolve(
+                    entry["baseline_path"], must_exist=True, regular=True
+                )
+            )
             probe = self._probe(media_path)
             scenes = self._scene_changes(media_path)
             silences = self._silences(media_path)

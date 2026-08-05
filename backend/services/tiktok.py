@@ -992,7 +992,14 @@ class TikTokPublicationService:
             raise PublicationError("Review was not found.")
         if float(review["render_duration"]) > 600:
             raise PublicationError("TikTok inbox upload supports videos up to 10 minutes.")
-        path = Path(review["preview_path"])
+        try:
+            path = self.queue.paths.resolve(
+                review["preview_path"], must_exist=True, regular=True
+            )
+        except ValueError as error:
+            raise PublicationError(
+                "The approved rendered media is unavailable or unsafe."
+            ) from error
         checksum = sha256_file(path)
         return self.store.prepare(
             review=review, media_path=path, media_sha256=checksum,

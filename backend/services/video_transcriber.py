@@ -138,10 +138,14 @@ class VideoTranscriber:
         local_path = record["local_file_path"]
         if not isinstance(local_path, str) or not local_path.strip():
             return self._failure(video_id, "Local media path is missing.")
-        media_path = Path(local_path)
-        if not media_path.is_file():
+        try:
+            media_path = self.manifest.paths.resolve(
+                local_path, must_exist=True, regular=True
+            )
+        except ValueError:
             return self._failure(
-                video_id, f"Local media file does not exist: {media_path}"
+                video_id,
+                "Local media file does not exist or is outside persistent storage.",
             )
 
         started_at = utc_now()
@@ -288,7 +292,7 @@ class VideoTranscriber:
         document = {
             "version": 1,
             "video_id": video_id,
-            "source_media_path": str(media_path),
+            "source_media_path": self.manifest.paths.store(media_path),
             "model": self.model_name,
             "language": self._optional_attr(info, "language")
             or self.language,

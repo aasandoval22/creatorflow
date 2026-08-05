@@ -27,6 +27,7 @@ from backend.services.publication import (
 )
 from backend.services.reference_clip_library import ReferenceClipLibrary
 from backend.services.video_manifest import VideoManifest, utc_now
+from backend.services.path_migration import build_media_coverage, load_orphan_registry
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -130,18 +131,19 @@ class MediaOwnershipGraph:
     ) -> None:
         self.data_root = Path(data_root).resolve()
         self.manifest = manifest or VideoManifest(
-            self.data_root / "manifests" / "videos.json"
+            self.data_root / "manifests" / "videos.json", data_root=self.data_root
         )
         self.queue = queue or ClipReviewQueue(
-            self.data_root / "review_queue" / "reviews.json"
+            self.data_root / "review_queue" / "reviews.json", data_root=self.data_root
         )
         self.publications = publications or PublicationStore(
             self.data_root / "publication" / "records.json",
             self.data_root / "publication" / "events.jsonl",
+            data_root=self.data_root,
         )
         index = self.data_root / "reference_clips" / "index.json"
         self.references = references or ReferenceClipLibrary(
-            self.data_root / "reference_clips", index
+            self.data_root / "reference_clips", index, data_root=self.data_root
         )
 
     def build(self) -> dict[str, Any]:
@@ -157,7 +159,8 @@ class MediaOwnershipGraph:
         for attempt in attempts:
             attempts_by_review.setdefault(attempt["review_id"], []).append(attempt)
         sources = []
-        for record in self.manifest.read_records():
+        manifest_records = self.manifest.read_records()
+        for record in manifest_records:
             source_reviews = []
             for review in review_by_video.get(record["video_id"], []):
                 source_reviews.append({
@@ -181,12 +184,55 @@ class MediaOwnershipGraph:
                 "source_video_id": record["video_id"],
                 "source_manifest": str(self.manifest.path),
                 "downloaded_source_media": record.get("local_file_path"),
+                "downloaded_at": record.get("downloaded_at"),
                 "transcript_and_word_timings": transcription.get("transcript_json_path"),
                 "transcript_text": transcription.get("transcript_text_path"),
                 "subtitle": transcription.get("subtitle_srt_path"),
                 "candidate_artifact": analysis.get("candidates_json_path"),
                 "reviews": source_reviews,
             })
+        known_video_ids = {
+            record["video_id"] for record in manifest_records
+            if record.get("local_file_path")
+        }
+        registry_path = self.data_root / "path_migration" / "orphan_ownership.json"
+        if registry_path.exists():
+            try:
+                registry = load_orphan_registry(registry_path)
+            except (OSError, ValueError) as error:
+                raise MediaLifecycleError(
+                    f"Orphan ownership registry is corrupt: {error}."
+                ) from error
+            for entry in registry.get("entries", []):
+                if entry.get("video_id") in known_video_ids:
+                    continue
+                source_reviews = []
+                for review in review_by_video.get(entry["video_id"], []):
+                    source_reviews.append({
+                        "review_id": review["review_id"],
+                        "candidate_id": review["candidate_id"],
+                        "status": review["status"],
+                        "timing_revision": review["timing_revision"],
+                        "rendered_preview": review["preview_path"],
+                        "preview_metadata": review["preview_metadata_path"],
+                        "approved_final_render": review["preview_path"]
+                        if review["status"] == "approved" else None,
+                        "publication_attempts": attempts_by_review.get(
+                            review["review_id"], []
+                        ),
+                    })
+                sources.append({
+                    "source_creator": entry.get("creator"),
+                    "source_video_id": entry["video_id"],
+                    "source_manifest": str(registry_path),
+                    "downloaded_source_media": str(
+                        self.data_root / entry["media_path"]
+                    ),
+                    "downloaded_at": entry.get("adopted_at"),
+                    "transcript_and_word_timings": None,
+                    "transcript_text": None, "subtitle": None,
+                    "candidate_artifact": None, "reviews": source_reviews,
+                })
         return {
             "version": 1,
             "generated_at": utc_now(),
@@ -257,6 +303,9 @@ class MediaCleanupService:
             "policy": asdict(self.policy),
             "items": self.evaluate(),
         }
+        document["coverage"] = build_media_coverage(
+            self.data_root, cleanup_items=document["items"]
+        )
         document["content_sha256"] = _content_hash(document)
         path = self.plan_path(plan_id)
         if path.exists():
@@ -278,14 +327,14 @@ class MediaCleanupService:
         for attempt in attempts:
             attempts_by_review.setdefault(attempt["review_id"], []).append(attempt)
         items: list[dict[str, Any]] = []
-        records = {item["video_id"]: item for item in self.graph.manifest.read_records()}
         reviews = self.graph.queue.list_items()
         reviews_by_video: dict[str, list[dict[str, Any]]] = {}
         for review in reviews:
             reviews_by_video.setdefault(review["video_id"], []).append(review)
 
-        for video_id, record in records.items():
-            raw_path = record.get("local_file_path")
+        for source in graph["sources"]:
+            video_id = source["source_video_id"]
+            raw_path = source.get("downloaded_source_media")
             if not raw_path:
                 continue
             path = Path(raw_path).expanduser()
@@ -327,7 +376,7 @@ class MediaCleanupService:
                     reasons.append(
                         f"review {review['review_id']} has unresolved or failed publication state"
                     )
-            downloaded = _parse_time(record.get("downloaded_at"))
+            downloaded = _parse_time(source.get("downloaded_at"))
             if downloaded:
                 eligible_base.append(downloaded)
             eligible_at = (

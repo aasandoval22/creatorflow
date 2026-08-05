@@ -492,6 +492,46 @@ not install, enable, or start them. See
 the ownership graph, exact retention rules, recovery commands, TikTok app
 configuration, controlled first-upload procedure, and security limitations.
 
+### Persistent-path normalization
+
+Active metadata stores managed file paths relative to the persistent data root
+(`/home/aasandoval/.local/share/creatorflow/data`). New records therefore do
+not depend on a development checkout, a production release, `current`, or a
+symlink. Readers remain compatible with explicitly recognized historical data
+roots while an audited migration is pending.
+
+Create and inspect a read-only, checksum-pinned migration plan:
+
+```bash
+.venv/bin/python -m backend.app.path_migration plan
+.venv/bin/python -m backend.app.path_migration show --plan-id PLAN_ID
+```
+
+Planning writes only ignored plan/audit metadata. It never rewrites records or
+moves media. A plan reports each proposed field, source-record hash, target
+inode/device, owner, size and SHA-256. Strict versioned/current release data
+paths are eligible only when they identify the same canonical file. Malformed
+release paths, unknown roots, ambiguous prefixes, symlinks, special files,
+ownership mismatches and changed identities remain manual-review findings.
+
+After merge and a separate operator review, apply and (if necessary) restore a
+specific plan with matching explicit confirmation:
+
+```bash
+.venv/bin/python -m backend.app.path_migration apply \
+  --plan-id PLAN_ID --confirm PLAN_ID
+.venv/bin/python -m backend.app.path_migration restore \
+  --recovery-id RECOVERY_ID
+```
+
+Application locks production/review/publication/cleanup state, revalidates
+records and media, backs up every changed metadata document, and replaces JSON
+atomically. It does not move or delete media, change review decisions or
+timings, enable cleanup, or publish anything. See
+[`docs/persistent-path-migration.md`](docs/persistent-path-migration.md) for the
+path model, orphan-evidence rules, coverage report, recovery workflow, and
+post-merge commands.
+
 ## Accepted clip references
 
 Accepted references describe clips that a user considers publishable. They are

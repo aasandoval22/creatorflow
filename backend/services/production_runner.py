@@ -389,6 +389,18 @@ class ProductionRunner:
                     error=str(error),
                 )
 
+    def _safe_download_exists(self, stored_path: str) -> bool:
+        resolver = getattr(self.dependencies.manifest, "paths", None)
+        if resolver is None:
+            return Path(stored_path).is_file()
+        try:
+            resolver.resolve(
+                stored_path, must_exist=True, regular=True
+            )
+        except (OSError, ValueError):
+            return False
+        return True
+
     def _process_video(
         self, creator: str, channel_url: str, metadata: dict[str, Any],
         document: dict[str, Any], summary: ProductionSummary,
@@ -401,7 +413,7 @@ class ProductionRunner:
         reusable_download = bool(
             record and record["status"] == VideoStatus.DOWNLOADED.value
             and isinstance(record.get("local_file_path"), str)
-            and Path(record["local_file_path"]).is_file()
+            and self._safe_download_exists(record["local_file_path"])
         )
         if not reusable_download:
             result = self.dependencies.downloader.download_discovered_entry(

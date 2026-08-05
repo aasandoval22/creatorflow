@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from backend.services.video_manifest import utc_now
+from backend.services.persistent_paths import (
+    PersistentPathError,
+    PersistentPathResolver,
+    infer_data_root,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -212,9 +217,14 @@ class PublicationStore:
     def __init__(
         self, path: Path = DEFAULT_PUBLICATION_PATH,
         audit_path: Path = DEFAULT_PUBLICATION_AUDIT_PATH,
+        *, data_root: Path | None = None,
+        path_resolver: PersistentPathResolver | None = None,
     ) -> None:
         self.path = Path(path)
         self.audit_path = Path(audit_path)
+        self.paths = path_resolver or PersistentPathResolver(
+            data_root or infer_data_root(self.path, "publication")
+        )
         self.lock_path = self.path.with_name(f"{self.path.name}.lock")
         key = self.path.resolve()
         with self._registry_guard:
@@ -363,11 +373,22 @@ class PublicationStore:
     ) -> list[dict[str, Any]]:
         with self.locked():
             attempts = self._read()["attempts"]
-        return copy.deepcopy([
-            attempt for attempt in attempts
+        return [self._materialize_attempt(attempt) for attempt in attempts
             if (review_id is None or attempt["review_id"] == review_id)
             and (platform is None or attempt["platform"] == platform)
-        ])
+        ]
+
+    def _materialize_attempt(self, attempt: Mapping[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(dict(attempt))
+        try:
+            result["rendered_media_path"] = str(
+                self.paths.materialize(result["rendered_media_path"])
+            )
+        except PersistentPathError as error:
+            raise PublicationError(
+                f"Publication attempt contains an unsafe media path: {error}"
+            ) from error
+        return result
 
     def get(self, attempt_id: str) -> dict[str, Any]:
         attempt = next(
@@ -425,7 +446,7 @@ class PublicationStore:
             )
             if existing is not None:
                 if existing["state"] != PublicationState.AWAITING_CONSENT.value:
-                    return copy.deepcopy(existing)
+                    return self._materialize_attempt(existing)
                 existing.update(
                     caption=caption,
                     source_attribution=source_attribution,
@@ -436,14 +457,14 @@ class PublicationStore:
                 )
                 self._write(document)
                 self._audit(existing, "preparation_updated")
-                return copy.deepcopy(existing)
+                return self._materialize_attempt(existing)
             attempt = {
                 "attempt_id": f"publication_{uuid.uuid4().hex[:24]}",
                 "review_id": str(review["review_id"]),
                 "source_video_id": str(review["video_id"]),
                 "candidate_id": str(review["candidate_id"]),
                 "timing_revision": int(review["timing_revision"]),
-                "rendered_media_path": str(Path(media_path)),
+                "rendered_media_path": self.paths.store(media_path),
                 "rendered_media_sha256": media_sha256,
                 "platform": platform,
                 "destination_account_id": destination_account_id,
@@ -474,7 +495,7 @@ class PublicationStore:
             document["attempts"].append(attempt)
             self._write(document)
             self._audit(attempt, "prepared")
-            return copy.deepcopy(attempt)
+            return self._materialize_attempt(attempt)
 
     def transition(
         self, attempt_id: str, state: PublicationState | str, *,
@@ -537,7 +558,7 @@ class PublicationStore:
                 attempt["next_reconcile_at"] = None
             self._write(document)
             self._audit(attempt, event or f"state_{target}")
-            return copy.deepcopy(attempt)
+            return self._materialize_attempt(attempt)
 
     def record_status_check(self, attempt_id: str) -> dict[str, Any]:
         with self.locked():
@@ -551,7 +572,7 @@ class PublicationStore:
             attempt["last_status_at"] = utc_now()
             attempt["updated_at"] = attempt["last_status_at"]
             self._write(document)
-            return copy.deepcopy(attempt)
+            return self._materialize_attempt(attempt)
 
     def mark_stale(self, review_id: str, reason: str) -> int:
         safe_reason = safe_publication_text(reason)
@@ -590,10 +611,20 @@ class PublicationStore:
             or attempt.get("timing_revision") != review.get("timing_revision")
         ):
             raise PublicationError("The review identity or timing revision changed.")
-        path = Path(str(review.get("preview_path") or ""))
-        if not path.is_file():
-            raise PublicationError("The approved rendered media is unavailable.")
-        if str(path) != attempt.get("rendered_media_path"):
+        try:
+            path = self.paths.resolve(
+                str(review.get("preview_path") or ""),
+                must_exist=True, regular=True,
+            )
+            attempt_path = self.paths.resolve(
+                str(attempt.get("rendered_media_path") or ""),
+                must_exist=True, regular=True,
+            )
+        except PersistentPathError as error:
+            raise PublicationError(
+                "The approved rendered media is unavailable or unsafe."
+            ) from error
+        if path != attempt_path:
             raise PublicationError("The approved rendered-media path changed.")
         if sha256_file(path) != attempt.get("rendered_media_sha256"):
             raise PublicationError("The approved rendered-media checksum changed.")

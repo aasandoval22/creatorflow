@@ -106,8 +106,17 @@ class ClipTimingAdjustmentService:
         )
         proposed_start = context["render"]["start"]
         proposed_end = context["render"]["end"]
-        old_video = Path(item["preview_path"])
-        old_metadata = Path(item["preview_metadata_path"])
+        try:
+            old_video = self.queue.paths.resolve(
+                item["preview_path"], must_exist=True, regular=True
+            )
+            old_metadata = self.queue.paths.resolve(
+                item["preview_metadata_path"], must_exist=True, regular=True
+            )
+        except ValueError as error:
+            raise ReviewQueueError(
+                "Stored preview paths are missing or outside persistent storage."
+            ) from error
         backups: list[tuple[Path, Path]] = []
         if not dry_run:
             for original in (old_video, old_metadata):

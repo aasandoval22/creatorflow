@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from backend.services.video_manifest import utc_now
+from backend.services.persistent_paths import (
+    PersistentPathError,
+    PersistentPathResolver,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REFERENCE_ROOT = PROJECT_ROOT / "data" / "reference_clips"
@@ -166,10 +170,16 @@ def annotation_defaults(baseline: dict[str, Any]) -> dict[str, Any]:
 
 class ReferenceClipLibrary:
     def __init__(
-        self, root: Path = DEFAULT_REFERENCE_ROOT, index_path: Path | None = None
+        self, root: Path = DEFAULT_REFERENCE_ROOT, index_path: Path | None = None,
+        *, data_root: Path | None = None,
+        path_resolver: PersistentPathResolver | None = None,
     ) -> None:
         self.root = Path(root)
         self.index_path = Path(index_path) if index_path is not None else self.root / "index.json"
+        inferred_root = Path(data_root) if data_root is not None else (
+            self.root.parent if self.root.name == "reference_clips" else self.root.parent
+        )
+        self.paths = path_resolver or PersistentPathResolver(inferred_root)
         if self.index_path.exists():
             self._load()
 
@@ -229,7 +239,16 @@ class ReferenceClipLibrary:
                 raise ReferenceClipError(f"Reference index entry {index} has an unsupported status.")
             _timestamp(item["created_at"], f"Entry {index} created_at")
             _timestamp(item["updated_at"], f"Entry {index} updated_at")
-            identity = str(Path(item["media_path"]).resolve())
+            try:
+                identity = self.paths.classify(item["media_path"]).relative_path
+            except PersistentPathError as error:
+                raise ReferenceClipError(
+                    f"Reference index entry {index} has an unsafe media path: {error}"
+                ) from error
+            if identity is None:
+                raise ReferenceClipError(
+                    f"Reference index entry {index} has an unrecognized media path."
+                )
             if item["reference_id"] in ids:
                 raise ReferenceClipError(f"Duplicate reference_id {item['reference_id']!r} in index.")
             if identity in identities:
@@ -259,17 +278,24 @@ class ReferenceClipLibrary:
         if not isinstance(profile, str) or not _PROFILE.fullmatch(profile):
             raise ReferenceClipError("profile_name is invalid.")
         document = self._load()
-        resolved = str(media)
+        try:
+            resolved = self.paths.store(media)
+            stored_baseline = self.paths.store(baseline_file)
+            stored_source = self.paths.store(source) if source else None
+            stored_analysis = self.paths.store(baseline_file.parent / "analysis.json")
+        except PersistentPathError as error:
+            raise ReferenceClipError(f"Reference path is not managed: {error}") from error
         if any(item["reference_id"] == chosen_id for item in document["references"]):
             raise ReferenceClipError(f"Reference ID {chosen_id!r} is already registered.")
-        if any(str(Path(item["media_path"]).resolve()) == resolved for item in document["references"]):
+        if any(self.paths.classify(item["media_path"]).relative_path == resolved
+               for item in document["references"]):
             raise ReferenceClipError(f"Media file {media} is already registered.")
         now = utc_now()
         entry = {
             "reference_id": chosen_id, "media_path": resolved,
-            "source_info_path": str(source) if source else None,
-            "baseline_path": str(baseline_file),
-            "analysis_path": str(baseline_file.parent / "analysis.json"),
+            "source_info_path": stored_source,
+            "baseline_path": stored_baseline,
+            "analysis_path": stored_analysis,
             "checksum_sha256": sha256_file(media), "status": baseline["status"],
             "profile_name": profile, "creator": baseline["creator"],
             "created_at": now, "updated_at": now,
@@ -279,7 +305,7 @@ class ReferenceClipLibrary:
         document["updated_at"] = now
         self._validate_index(document)
         _atomic_json(self.index_path, document)
-        return copy.deepcopy(entry)
+        return self._materialize_entry(entry)
 
     def register_directory(
         self, directory: Path, *, reference_id: str | None = None,
@@ -304,7 +330,7 @@ class ReferenceClipLibrary:
         if status is not None and status not in ALLOWED_STATUSES:
             raise ReferenceClipError(f"Unsupported status filter: {status!r}.")
         return [
-            copy.deepcopy(item) for item in self._load()["references"]
+            self._materialize_entry(item) for item in self._load()["references"]
             if (status is None or item["status"] == status)
             and (creator is None or item["creator"].casefold() == creator.casefold())
             and (profile_name is None or item["profile_name"] == profile_name)
@@ -313,13 +339,26 @@ class ReferenceClipLibrary:
     def get(self, reference_id: str) -> dict[str, Any]:
         for item in self._load()["references"]:
             if item["reference_id"] == reference_id:
-                return copy.deepcopy(item)
+                return self._materialize_entry(item)
         raise ReferenceClipError(f"Reference {reference_id!r} is not registered.")
 
     def snapshot_index(self) -> dict[str, Any]:
         """Return a validated copy for a coordinated local transaction."""
 
         return copy.deepcopy(self._load())
+
+    def _materialize_entry(self, item: dict[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(item)
+        try:
+            for field in ("media_path", "baseline_path", "analysis_path"):
+                result[field] = str(self.paths.materialize(result[field]))
+            if result["source_info_path"] is not None:
+                result["source_info_path"] = str(
+                    self.paths.materialize(result["source_info_path"])
+                )
+        except PersistentPathError as error:
+            raise ReferenceClipError(f"Reference index contains an unsafe path: {error}") from error
+        return result
 
     def restore_index(self, document: dict[str, Any]) -> None:
         """Atomically restore a previously validated transaction snapshot."""
@@ -330,9 +369,14 @@ class ReferenceClipLibrary:
 
     def validate_checksum(self, reference_id: str) -> bool:
         entry = self.get(reference_id)
-        path = Path(entry["media_path"])
-        if not path.is_file():
-            raise ReferenceClipError(f"Registered media is missing: {path}")
+        try:
+            path = self.paths.resolve(
+                entry["media_path"], must_exist=True, regular=True
+            )
+        except PersistentPathError as error:
+            raise ReferenceClipError(
+                "Registered media is missing or outside persistent storage."
+            ) from error
         actual = sha256_file(path)
         if actual != entry["checksum_sha256"]:
             raise ReferenceClipError(
@@ -345,13 +389,15 @@ class ReferenceClipLibrary:
         document = self._load()
         for item in document["references"]:
             if item["reference_id"] == reference_id:
-                baseline = load_and_validate_baseline(Path(item["baseline_path"]))
+                baseline = load_and_validate_baseline(
+                    self.paths.resolve(item["baseline_path"], must_exist=True, regular=True)
+                )
                 if baseline["reference_id"] != reference_id:
                     raise ReferenceClipError("Updated baseline reference_id does not match the index.")
                 item.update(status=baseline["status"], creator=baseline["creator"], updated_at=utc_now())
                 document["updated_at"] = item["updated_at"]
                 _atomic_json(self.index_path, document)
-                return copy.deepcopy(item)
+                return self._materialize_entry(item)
         raise ReferenceClipError(f"Reference {reference_id!r} is not registered.")
 
     def remove(self, reference_id: str) -> dict[str, Any]:
@@ -364,4 +410,4 @@ class ReferenceClipLibrary:
         ]
         document["updated_at"] = utc_now()
         _atomic_json(self.index_path, document)
-        return copy.deepcopy(matches[0])
+        return self._materialize_entry(matches[0])

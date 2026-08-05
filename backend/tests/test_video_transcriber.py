@@ -108,7 +108,8 @@ def test_transcribes_with_required_settings_and_writes_artifacts(
         (transcriber.output_directory / "abc" / "transcript.json").read_text()
     )
     assert document["version"] == 1
-    assert document["source_media_path"] == str(media)
+    assert document["source_media_path"] == media.relative_to("/tmp").as_posix()
+    assert manifest.paths.resolve(document["source_media_path"]) == media
     assert document["text"] == "Hello world Again"
     assert document["segments"][0]["words"][0]["probability"] == 0.98
     assert document["segments"][1]["words"][0]["start"] is None

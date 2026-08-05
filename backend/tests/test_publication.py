@@ -75,6 +75,9 @@ def test_prepare_records_identity_consent_and_editable_caption(tmp_path):
     assert attempt["timing_revision"] == 0
     assert attempt["rendered_media_sha256"] == sha256_file(media)
     assert attempt["rights_confirmed_at"]
+    stored = json.loads(store.path.read_text())["attempts"][0]
+    assert not Path(stored["rendered_media_path"]).is_absolute()
+    assert store.paths.resolve(stored["rendered_media_path"]) == media
     updated = prepare(store, item, media, caption="Changed #caption")
     assert updated["attempt_id"] == attempt["attempt_id"]
     assert updated["caption"] == "Changed #caption"

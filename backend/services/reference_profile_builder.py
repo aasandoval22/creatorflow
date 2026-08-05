@@ -51,7 +51,9 @@ class ReferenceProfileBuilder:
             raise ReferenceProfileError(f"No accepted references are registered for {profile_name!r}.")
         durations, baselines, ids, analyses, input_versions = [], [], [], [], []
         for entry in references:
-            analysis_path = Path(entry["analysis_path"])
+            analysis_path = self.library.paths.resolve(
+                entry["analysis_path"], must_exist=True, regular=True
+            )
             if not analysis_path.is_file():
                 raise ReferenceProfileError(
                     f"Reference {entry['reference_id']} has no analysis; run analyze first."
@@ -66,7 +68,11 @@ class ReferenceProfileBuilder:
                 raise ReferenceProfileError(f"Analysis for {entry['reference_id']} lacks duration.") from error
             durations.append(duration)
             analyses.append(analysis)
-            baselines.append(load_and_validate_baseline(Path(entry["baseline_path"])))
+            baselines.append(load_and_validate_baseline(
+                self.library.paths.resolve(
+                    entry["baseline_path"], must_exist=True, regular=True
+                )
+            ))
             ids.append(entry["reference_id"])
             annotation = self.annotation_store.read(entry["reference_id"])
             input_versions.append({
@@ -459,7 +465,10 @@ class ReferenceProfileBuilder:
             if entry is None:
                 continue
             try:
-                analysis = json.loads(Path(entry["analysis_path"]).read_text(encoding="utf-8"))
+                analysis_path = self.library.paths.resolve(
+                    entry["analysis_path"], must_exist=True, regular=True
+                )
+                analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as error:
                 reasons.append(f"{reference_id} analysis is unavailable: {type(error).__name__}.")
             else:
