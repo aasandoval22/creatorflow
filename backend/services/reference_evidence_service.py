@@ -136,9 +136,19 @@ class ReferenceEvidenceService:
 
     def inspect(self, reference_id: str) -> dict[str, Any]:
         entry = self.accepted_entry(reference_id)
-        analysis = self._load_analysis(Path(entry["analysis_path"]), reference_id)
+        analysis = self._load_analysis(
+            self.library.paths.resolve(
+                entry["analysis_path"], must_exist=True, regular=True
+            ),
+            reference_id,
+        )
         annotation = self.annotations.read(reference_id)
-        baseline = self._load_json(Path(entry["baseline_path"]), "baseline")
+        baseline = self._load_json(
+            self.library.paths.resolve(
+                entry["baseline_path"], must_exist=True, regular=True
+            ),
+            "baseline",
+        )
         profile_membership = []
         if self.profile_builder.output_directory.exists():
             for path in sorted(self.profile_builder.output_directory.glob("*.json")):
@@ -270,7 +280,7 @@ class ReferenceEvidenceService:
             self._require_annotation_revision(
                 reference_id, expected_annotation_revision
             )
-            path = Path(entry["analysis_path"])
+            path = self.library.paths.resolve(entry["analysis_path"])
             snapshot = path.read_bytes() if path.exists() else None
             previous = self._load_analysis(path, reference_id) if snapshot is not None else None
             before_revision = analysis_revision(previous)

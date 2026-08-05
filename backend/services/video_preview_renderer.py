@@ -330,9 +330,14 @@ class VideoPreviewRenderer:
         raw_media = record.get("local_file_path")
         if not isinstance(raw_media, str) or not raw_media.strip():
             raise PreviewError(f"Video {video_id!r} has no valid local media path.")
-        media_path = Path(raw_media).expanduser().resolve()
-        if not media_path.is_file():
-            raise PreviewError(f"Source media file does not exist: {media_path}")
+        try:
+            media_path = self.manifest.paths.resolve(
+                raw_media, must_exist=True, regular=True
+            )
+        except ValueError as error:
+            raise PreviewError(
+                "Source media file does not exist or is outside persistent storage."
+            ) from error
         analysis = record.get("clip_analysis", {})
         if analysis.get("status") != ClipAnalysisStatus.COMPLETED.value:
             raise PreviewError(f"Clip analysis for {video_id!r} is not completed.")
@@ -341,7 +346,14 @@ class VideoPreviewRenderer:
         )
         if not selected_candidates_path:
             raise PreviewError("The completed clip analysis has no candidate artifact path.")
-        selected_candidates_path = Path(selected_candidates_path).expanduser().resolve()
+        try:
+            selected_candidates_path = self.manifest.paths.resolve(
+                selected_candidates_path, must_exist=True, regular=True
+            )
+        except ValueError as error:
+            raise PreviewError(
+                "Candidate artifact is missing or outside persistent storage."
+            ) from error
         artifact = self._read_json(selected_candidates_path, "candidate artifact")
         candidate = self.select_candidate(
             artifact, video_id, rank=rank, candidate_id=candidate_id
@@ -352,7 +364,14 @@ class VideoPreviewRenderer:
         transcript_path = transcription.get("transcript_json_path")
         if not isinstance(transcript_path, str) or not transcript_path:
             raise PreviewError("The completed transcription has no transcript JSON path.")
-        transcript_path = Path(transcript_path).expanduser().resolve()
+        try:
+            transcript_path = self.manifest.paths.resolve(
+                transcript_path, must_exist=True, regular=True
+            )
+        except ValueError as error:
+            raise PreviewError(
+                "Transcript artifact is missing or outside persistent storage."
+            ) from error
         transcript = self._read_json(transcript_path, "transcript artifact")
         if transcript.get("version") != 1 or transcript.get("video_id") != video_id:
             raise PreviewError("Transcript artifact version or video ID is invalid.")
@@ -672,9 +691,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             "version": 3, "video_id": context["record"]["video_id"],
             "candidate_id": candidate["candidate_id"],
             "candidate_rank": candidate["rank"],
-            "source_media_path": str(context["media_path"]),
-            "source_transcript_path": str(context["transcript_path"]),
-            "source_candidates_path": str(context["candidates_path"]),
+            "source_media_path": self.manifest.paths.store(context["media_path"]),
+            "source_transcript_path": self.manifest.paths.store(
+                context["transcript_path"]
+            ),
+            "source_candidates_path": self.manifest.paths.store(
+                context["candidates_path"]
+            ),
             "candidate_start": round(candidate["start"], 3),
             "candidate_end": round(candidate["end"], 3),
             "candidate_duration": round(candidate["duration"], 3),
@@ -689,7 +712,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             "context_reasons": context.get("context_reasons", []),
             "start_boundary_method": context.get("start_boundary_method"),
             "end_boundary_method": context.get("end_boundary_method"),
-            "output_path": str(final_video.resolve()), "created_at": utc_now(),
+            "output_path": self.manifest.paths.store(final_video),
+            "created_at": utc_now(),
             "render_configuration": configuration,
             "caption_configuration": {
                 "font_name": self.caption_configuration.font_name,
@@ -797,7 +821,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             document = self._read_json(metadata, "preview metadata")
             valid = (
                 document.get("version") in (1, 2, 3)
-                and Path(document.get("output_path", "")).resolve() == video.resolve()
+                and self.manifest.paths.resolve(
+                    document.get("output_path", "")
+                ) == video.resolve()
             )
             if render_start is not None:
                 stored_start = document.get("render_start", document.get("candidate_start"))
@@ -811,7 +837,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 valid = valid and document.get("timing_source") == "automatic"
                 valid = valid and document.get("context_profile") == context_profile
             return valid
-        except (PreviewError, OSError):
+        except (PreviewError, OSError, ValueError):
             return False
 
     def _result(

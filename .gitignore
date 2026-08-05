@@ -47,11 +47,13 @@ data/production/
 data/logs/production.jsonl
 data/publication/
 data/media_cleanup/
+data/path_migration/
 data/quarantine/
 data/**/cleanup.lock
 data/**/publication*.lock
 data/**/.cleanup-*
 data/**/.quarantine-*
+data/**/.path-migration-*
 tiktok_tokens.json
 tiktok_oauth_states.json
 data/reference_clips/**/.analysis.*

@@ -315,8 +315,9 @@ class ClipCandidateGenerator:
             error_message=None,
         )
         try:
-            transcript_path = Path(
-                record["transcription"]["transcript_json_path"]
+            transcript_path = self.manifest.paths.resolve(
+                record["transcription"]["transcript_json_path"],
+                must_exist=True, regular=True,
             )
             transcript = self.load_transcript(transcript_path, video_id)
             candidates = self.generate_candidates(
@@ -1231,8 +1232,8 @@ class ClipCandidateGenerator:
         document = {
             "version": 1,
             "video_id": record["video_id"],
-            "source_transcript_path": str(transcript_path),
-            "source_media_path": record["local_file_path"],
+            "source_transcript_path": self.manifest.paths.store(transcript_path),
+            "source_media_path": self.manifest.paths.store(record["local_file_path"]),
             "created_at": utc_now(),
             "configuration": {
                 "minimum_duration_seconds": config.minimum_duration_seconds,

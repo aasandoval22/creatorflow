@@ -7,6 +7,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from backend.services.persistent_paths import (
+    PersistentPathError,
+    PersistentPathResolver,
+    infer_data_root,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST_PATH = PROJECT_ROOT / "data" / "manifests" / "videos.json"
@@ -127,8 +133,15 @@ def utc_now() -> str:
 class VideoManifest:
     """Store validated video ingestion records in an atomic JSON manifest."""
 
-    def __init__(self, path: Path = DEFAULT_MANIFEST_PATH) -> None:
+    def __init__(
+        self, path: Path = DEFAULT_MANIFEST_PATH, *,
+        data_root: Path | None = None,
+        path_resolver: PersistentPathResolver | None = None,
+    ) -> None:
         self.path = Path(path)
+        self.paths = path_resolver or PersistentPathResolver(
+            data_root or infer_data_root(self.path, "manifests")
+        )
         if not self.path.exists():
             self._write_document(self._empty_document())
         else:
@@ -167,7 +180,7 @@ class VideoManifest:
 
         document = self._read_document()
         self._validate_document(document)
-        return copy.deepcopy(document["videos"])
+        return [self._materialize_record(record) for record in document["videos"]]
 
     def get(self, video_id: str) -> dict[str, Any] | None:
         """Return one video record, if present."""
@@ -185,7 +198,7 @@ class VideoManifest:
         """Insert or replace a record while preserving durable state."""
 
         candidate = copy.deepcopy(record)
-        records = self.read_records()
+        records = copy.deepcopy(self._read_document()["videos"])
         existing_index = next(
             (
                 index
@@ -209,6 +222,10 @@ class VideoManifest:
                 existing["clip_analysis"]
             )
 
+        candidate = self._canonicalize_record_paths(
+            candidate, previous=existing if existing_index is not None else None
+        )
+
         self._validate_record(candidate, "new record", RECORD_FIELDS)
         if existing_index is None:
             records.append(candidate)
@@ -218,7 +235,7 @@ class VideoManifest:
         self._write_document(
             {"version": MANIFEST_VERSION, "videos": records}
         )
-        return copy.deepcopy(candidate)
+        return self._materialize_record(candidate)
 
     def update_transcription(
         self, video_id: str, **changes: Any
@@ -231,20 +248,26 @@ class VideoManifest:
                 "Unknown transcription fields: "
                 f"{', '.join(sorted(unknown))}."
             )
-        records = self.read_records()
+        records = copy.deepcopy(self._read_document()["videos"])
         record = next(
             (item for item in records if item["video_id"] == video_id), None
         )
         if record is None:
             raise ManifestError(f"Video {video_id!r} was not found.")
-        record["transcription"].update(copy.deepcopy(changes))
+        changes = copy.deepcopy(changes)
+        for field in (
+            "transcript_json_path", "transcript_text_path", "subtitle_srt_path",
+        ):
+            if changes.get(field) is not None:
+                changes[field] = self._store_path(changes[field], field)
+        record["transcription"].update(changes)
         self._validate_transcription(
             record["transcription"], f"record {video_id!r}"
         )
         self._write_document(
             {"version": MANIFEST_VERSION, "videos": records}
         )
-        return copy.deepcopy(record)
+        return self._materialize_record(record)
 
     def update_clip_analysis(
         self, video_id: str, **changes: Any
@@ -257,20 +280,97 @@ class VideoManifest:
                 "Unknown clip-analysis fields: "
                 f"{', '.join(sorted(unknown))}."
             )
-        records = self.read_records()
+        records = copy.deepcopy(self._read_document()["videos"])
         record = next(
             (item for item in records if item["video_id"] == video_id), None
         )
         if record is None:
             raise ManifestError(f"Video {video_id!r} was not found.")
-        record["clip_analysis"].update(copy.deepcopy(changes))
+        changes = copy.deepcopy(changes)
+        if changes.get("candidates_json_path") is not None:
+            changes["candidates_json_path"] = self._store_path(
+                changes["candidates_json_path"], "candidates_json_path"
+            )
+        record["clip_analysis"].update(changes)
         self._validate_clip_analysis(
             record["clip_analysis"], f"record {video_id!r}"
         )
         self._write_document(
             {"version": MANIFEST_VERSION, "videos": records}
         )
-        return copy.deepcopy(record)
+        return self._materialize_record(record)
+
+    def _store_path(self, value: Any, field: str) -> str:
+        try:
+            return self.paths.store(value)
+        except (OSError, PersistentPathError) as error:
+            raise ManifestError(
+                f"Manifest field {field!r} is not a managed persistent path: {error}"
+            ) from error
+
+    def _preserve_or_store_path(
+        self, value: Any, previous: Any, field: str,
+    ) -> str:
+        if isinstance(previous, str):
+            current = self.paths.classify(os.fspath(value))
+            prior = self.paths.classify(previous)
+            if (
+                current.relative_path is not None
+                and current.relative_path == prior.relative_path
+            ):
+                return previous
+        return self._store_path(value, field)
+
+    def _canonicalize_record_paths(
+        self, record: dict[str, Any], *, previous: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = copy.deepcopy(record)
+        previous = previous or {}
+        if result.get("local_file_path") is not None:
+            result["local_file_path"] = self._preserve_or_store_path(
+                result["local_file_path"], previous.get("local_file_path"),
+                "local_file_path",
+            )
+        transcription = result.get("transcription") or {}
+        prior_transcription = previous.get("transcription") or {}
+        for field in (
+            "transcript_json_path", "transcript_text_path", "subtitle_srt_path",
+        ):
+            if transcription.get(field) is not None:
+                transcription[field] = self._preserve_or_store_path(
+                    transcription[field], prior_transcription.get(field), field
+                )
+        analysis = result.get("clip_analysis") or {}
+        prior_analysis = previous.get("clip_analysis") or {}
+        if analysis.get("candidates_json_path") is not None:
+            analysis["candidates_json_path"] = self._preserve_or_store_path(
+                analysis["candidates_json_path"],
+                prior_analysis.get("candidates_json_path"),
+                "candidates_json_path",
+            )
+        return result
+
+    def _materialize_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(record)
+        try:
+            if result.get("local_file_path") is not None:
+                result["local_file_path"] = str(
+                    self.paths.materialize(result["local_file_path"])
+                )
+            transcription = result.get("transcription") or {}
+            for field in (
+                "transcript_json_path", "transcript_text_path", "subtitle_srt_path",
+            ):
+                if transcription.get(field) is not None:
+                    transcription[field] = str(self.paths.materialize(transcription[field]))
+            analysis = result.get("clip_analysis") or {}
+            if analysis.get("candidates_json_path") is not None:
+                analysis["candidates_json_path"] = str(
+                    self.paths.materialize(analysis["candidates_json_path"])
+                )
+        except PersistentPathError as error:
+            raise ManifestError(f"Manifest contains an unsafe active path: {error}") from error
+        return result
 
     def _write_document(self, document: dict[str, Any]) -> None:
         self._validate_document(document)

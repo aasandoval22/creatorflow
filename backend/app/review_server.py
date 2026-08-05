@@ -1006,11 +1006,11 @@ any clip can be sent.</p>
             return
         try:
             entry = service.accepted_entry(reference_id)
-            path = Path(entry["media_path"])
-            if not path.is_file():
-                raise OSError
+            path = service.library.paths.resolve(
+                entry["media_path"], must_exist=True, regular=True
+            )
             size = path.stat().st_size
-        except (ReferenceEvidenceError, OSError):
+        except (ReferenceEvidenceError, OSError, ValueError):
             self._text(HTTPStatus.NOT_FOUND, "Reference media was not found.", head=head)
             return
         self._send_file(path, size, head=head)
@@ -1069,12 +1069,12 @@ any clip can be sent.</p>
         if item is None:
             self._text(HTTPStatus.NOT_FOUND, "That review or preview was not found.", head=head)
             return
-        path = Path(item["preview_path"])
         try:
-            if not path.is_file():
-                raise OSError
+            path = self.server.app.queue.paths.resolve(
+                item["preview_path"], must_exist=True, regular=True
+            )
             size = path.stat().st_size
-        except OSError:
+        except (OSError, ValueError):
             self._text(HTTPStatus.NOT_FOUND, "That review or preview was not found.", head=head)
             return
         start, end, partial = 0, max(0, size - 1), False

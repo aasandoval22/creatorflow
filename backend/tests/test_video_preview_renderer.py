@@ -264,6 +264,11 @@ def test_success_atomic_artifacts_and_skip(preview_files):
     metadata = json.loads(Path(result.metadata_path).read_text())
     assert metadata["candidate_id"] == "one"
     assert metadata["probe"]["width"] == 1080
+    for field in (
+        "source_media_path", "source_transcript_path",
+        "source_candidates_path", "output_path",
+    ):
+        assert not Path(metadata[field]).is_absolute()
     assert not list(Path(result.output_path).parent.glob(".*.tmp*"))
     assert service.render("video").status is PreviewResultStatus.SKIPPED
 

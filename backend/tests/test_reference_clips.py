@@ -132,6 +132,9 @@ def test_explicit_paths_stable_id_and_streaming_large_media(tmp_path):
         load_and_validate_baseline(directory / "baseline.json"),
         directory / "reference.mp4",
     ) == entry["reference_id"]
+    stored = json.loads(library.index_path.read_text())["references"][0]
+    assert not Path(stored["media_path"]).is_absolute()
+    assert library.paths.resolve(stored["media_path"]) == directory / "reference.mp4"
 
 
 @pytest.mark.parametrize("missing", ["reference.mp4", "baseline.json"])

@@ -255,8 +255,8 @@ class BatchPreviewRenderer:
             ))
         return BatchPreviewResult(video_id, tuple(results))
 
-    @staticmethod
     def _verify_preview(
+        self,
         preview_path: str | None, metadata_path: str | None,
         video_id: str, candidate_id: str,
     ) -> None:
@@ -270,5 +270,11 @@ class BatchPreviewRenderer:
             raise ValueError("Preview metadata version is invalid.")
         if metadata.get("video_id") != video_id or metadata.get("candidate_id") != candidate_id:
             raise ValueError("Preview metadata identity does not match the candidate.")
-        if Path(metadata.get("output_path", "")).resolve() != Path(preview_path).resolve():
+        stored_output = metadata.get("output_path", "")
+        resolver = getattr(self.renderer.manifest, "paths", None)
+        materialized = (
+            resolver.resolve(stored_output) if resolver is not None
+            else Path(stored_output).resolve()
+        )
+        if materialized != Path(preview_path).resolve():
             raise ValueError("Preview metadata output path does not match the preview.")

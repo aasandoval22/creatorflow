@@ -20,6 +20,11 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
 
 from backend.services.video_manifest import utc_now
+from backend.services.persistent_paths import (
+    PersistentPathError,
+    PersistentPathResolver,
+    infer_data_root,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -74,8 +79,13 @@ class ClipReviewQueue:
     def __init__(
         self, path: Path = DEFAULT_REVIEW_QUEUE_PATH, *,
         process_lock: threading.RLock | None = None,
+        data_root: Path | None = None,
+        path_resolver: PersistentPathResolver | None = None,
     ) -> None:
         self.path = Path(path)
+        self.paths = path_resolver or PersistentPathResolver(
+            data_root or infer_data_root(self.path, "review_queue")
+        )
         self.lock_path = self.path.with_name(f"{self.path.name}.lock")
         if process_lock is None:
             key = self.path.resolve()
@@ -287,7 +297,37 @@ class ClipReviewQueue:
             if (status is None or item["status"] == status)
             and (video_id is None or item["video_id"] == video_id)
         ]
-        return copy.deepcopy(selected)
+        return [self._materialize_item(item) for item in selected]
+
+    def _stored_path(self, value: str | Path, field: str) -> str:
+        try:
+            return self.paths.store(value)
+        except PersistentPathError as error:
+            raise ReviewQueueError(
+                f"Review field {field!r} is not a managed persistent path: {error}"
+            ) from error
+
+    def _preserve_or_store_path(
+        self, value: str | Path, previous: Any, field: str,
+    ) -> str:
+        if isinstance(previous, str):
+            current = self.paths.classify(os.fspath(value))
+            prior = self.paths.classify(previous)
+            if (
+                current.relative_path is not None
+                and current.relative_path == prior.relative_path
+            ):
+                return previous
+        return self._stored_path(value, field)
+
+    def _materialize_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(item)
+        try:
+            for field in ("preview_path", "preview_metadata_path"):
+                result[field] = str(self.paths.materialize(result[field]))
+        except PersistentPathError as error:
+            raise ReviewQueueError(f"Review queue contains an unsafe path: {error}") from error
+        return result
 
     def find_by_review_id(self, review_id: str) -> dict[str, Any] | None:
         return next((item for item in self.list_items() if item["review_id"] == review_id), None)
@@ -363,8 +403,13 @@ class ClipReviewQueue:
             "timing_source": preserved.get("timing_source") if preserve_timing else timing_source,
             "context_profile": preserved.get("context_profile") if preserve_timing else context_profile,
             "context_reasons": preserved.get("context_reasons") if preserve_timing else list(context_reasons),
-            "preview_path": str(preview_path),
-            "preview_metadata_path": str(preview_metadata_path),
+            "preview_path": self._preserve_or_store_path(
+                preview_path, preserved.get("preview_path"), "preview_path"
+            ),
+            "preview_metadata_path": self._preserve_or_store_path(
+                preview_metadata_path, preserved.get("preview_metadata_path"),
+                "preview_metadata_path",
+            ),
             "status": preserved.get("status", "pending"),
             "reviewed_at": preserved.get("reviewed_at"),
             "review_note": preserved.get("review_note"),
@@ -378,7 +423,7 @@ class ClipReviewQueue:
             document["items"][document["items"].index(existing)] = item
         document["updated_at"] = now
         self._write_document(document)
-        return copy.deepcopy(item)
+        return self._materialize_item(item)
 
     def update_timing(
         self, review_id: str, *, render_start: float, render_end: float,
@@ -421,8 +466,13 @@ class ClipReviewQueue:
             timing_updated_at=now,
             timing_source=timing_source, context_profile=context_profile,
             context_reasons=list(context_reasons),
-            preview_path=str(preview_path),
-            preview_metadata_path=str(preview_metadata_path),
+            preview_path=self._preserve_or_store_path(
+                preview_path, item.get("preview_path"), "preview_path"
+            ),
+            preview_metadata_path=self._preserve_or_store_path(
+                preview_metadata_path, item.get("preview_metadata_path"),
+                "preview_metadata_path",
+            ),
             status="pending", reviewed_at=None, updated_at=now,
         )
         if clear_note:
@@ -431,7 +481,7 @@ class ClipReviewQueue:
             item["review_note"] = note
         document["updated_at"] = now
         self._write_document(document)
-        return copy.deepcopy(item)
+        return self._materialize_item(item)
 
     def _change(
         self, review_id: str, *, status: str | None = None,
@@ -455,7 +505,7 @@ class ClipReviewQueue:
             item["updated_at"] = now
             document["updated_at"] = now
             self._write_document(document)
-            return copy.deepcopy(item)
+            return self._materialize_item(item)
 
     def approve(self, review_id: str, note: str | None = None) -> dict[str, Any]:
         return self._change(review_id, status="approved", note=note, change_note=note is not None)
