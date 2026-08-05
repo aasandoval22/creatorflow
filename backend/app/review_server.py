@@ -45,6 +45,8 @@ from backend.services.reference_discovery import (
     YouTubeDataAPI,
 )
 from backend.services.video_manifest import DEFAULT_MANIFEST_PATH
+from backend.services.publication import PublicationError
+from backend.services.tiktok import TikTokError, TikTokPublicationService
 from backend.services.video_preview_renderer import (
     DEFAULT_PREVIEW_DIRECTORY, SAFE_PRESETS, CaptionConfiguration,
     RenderConfiguration, VideoPreviewRenderer,
@@ -94,6 +96,7 @@ class ReviewApplication:
     reference_discovery_service: ReferenceDiscoveryService | None = None
     reference_evidence_service: ReferenceEvidenceService | None = None
     comparison_batches: ReviewComparisonBatchService | None = None
+    tiktok_publications: TikTokPublicationService | None = None
 
 
 class ReviewHTTPServer(ThreadingHTTPServer):
@@ -142,6 +145,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         route = urlsplit(self.path)
         if route.path == "/":
             self._index(route.query, head=False)
+        elif route.path == "/tiktok/oauth/callback":
+            self._tiktok_oauth_callback(route.query, head=False)
         elif route.path == "/references":
             self._accepted_references(route.query, head=False)
         elif self._reference_analysis_route(route.path) is not None:
@@ -169,6 +174,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         route = urlsplit(self.path)
         if route.path == "/":
             self._index(route.query, head=True)
+        elif route.path == "/tiktok/oauth/callback":
+            self._tiktok_oauth_callback(route.query, head=True)
         elif route.path == "/references":
             self._accepted_references(route.query, head=True)
         elif self._reference_analysis_route(route.path) is not None:
@@ -194,6 +201,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
+        if path in {"/tiktok/connect", "/tiktok/disconnect", "/tiktok/oauth/complete"}:
+            self._tiktok_account_action(path)
+            return
         evidence_route = self._evidence_write_route(path)
         if evidence_route is not None:
             self._reference_evidence_action(*evidence_route)
@@ -224,8 +234,10 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 message = self._reset(review_id, form)
             elif action == "reapply-context":
                 message = self._reapply_context(review_id, form)
-            else:
+            elif action == "compare-reference":
                 message = self._compare_reference(review_id)
+            else:
+                message = self._tiktok_review_action(review_id, action, form)
         except RequestError as error:
             self._text(error.status, error.message)
             return
@@ -256,7 +268,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "reviews" and parts[2] in {
             "decision", "adjust", "reset-timing", "reapply-context",
-            "compare-reference",
+            "compare-reference", "tiktok-prepare", "tiktok-send",
+            "tiktok-refresh", "tiktok-cancel", "tiktok-retry",
         }:
             review_id = parts[1]
             if review_id and "/" not in review_id and review_id.startswith("review_"):
@@ -362,6 +375,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                     item = queue.update_note(review_id, None)
             else:
                 item = queue.return_to_pending(review_id, note, clear_note=clear)
+        publisher = self.server.app.tiktok_publications
+        if publisher is not None and item["status"] != "approved":
+            publisher.mark_review_stale(review_id)
         return f"{item['review_id']} is now {item['status']}."
 
     @staticmethod
@@ -413,6 +429,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             review_id, lead_in=lead, tail=tail, render_start=start, render_end=end,
             allow_longer=allow_longer, note=note, clear_note=clear, force=True,
         )
+        self._mark_publication_stale(review_id)
         return (
             f"Preview rerendered at revision {result.item['timing_revision']}: "
             f"{result.render_start:.3f}–{result.render_end:.3f}s. It is pending review."
@@ -423,6 +440,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         result = self.server.app.timing_service.reset(
             review_id, note=note, clear_note=clear, force=True
         )
+        self._mark_publication_stale(review_id)
         return (
             f"Preview reset to candidate timing at revision {result.item['timing_revision']}: "
             f"{result.render_start:.3f}–{result.render_end:.3f}s. It is pending review."
@@ -433,6 +451,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         result = self.server.app.timing_service.reapply_context(
             review_id, profile="reaction", note=note, clear_note=clear, force=True
         )
+        self._mark_publication_stale(review_id)
         return (
             f"Automatic reaction context reapplied at revision "
             f"{result.item['timing_revision']}: {result.render_start:.3f}–"
@@ -451,6 +470,120 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             f"{review_id} compared locally against "
             f"{self.server.app.reference_profile}; review state was unchanged."
         )
+
+    def _mark_publication_stale(self, review_id: str) -> None:
+        publisher = self.server.app.tiktok_publications
+        if publisher is not None:
+            publisher.mark_review_stale(review_id)
+
+    def _tiktok_review_action(
+        self, review_id: str, action: str, form: dict[str, list[str]],
+    ) -> str:
+        publisher = self.server.app.tiktok_publications
+        if publisher is None:
+            raise PublicationError("TikTok publication is not configured.")
+        if action == "tiktok-prepare":
+            caption = self._one(form, "caption", required=True) or ""
+            attribution = self._one(form, "source_attribution", required=True) or ""
+            if len(caption) > 2_200 or len(attribution) > 1_000:
+                raise RequestError(HTTPStatus.BAD_REQUEST, "TikTok text is too long.")
+            attempt = publisher.prepare(
+                review_id, caption=caption, source_attribution=attribution,
+                rights_confirmed=self._one(form, "rights_confirmed") == "yes",
+            )
+            return (
+                f"Draft {attempt['attempt_id']} prepared for explicit consent; "
+                "nothing was uploaded."
+            )
+        attempt_id = self._one(form, "attempt_id", required=True) or ""
+        if action == "tiktok-send":
+            attempt = publisher.send(
+                attempt_id, confirmed=self._one(form, "confirm_upload") == "yes"
+            )
+            return (
+                f"TikTok inbox transfer state: {attempt['state']}. Delivery does "
+                "not mean the clip is public; finish the post in TikTok."
+            )
+        if action == "tiktok-refresh":
+            attempt = publisher.refresh(attempt_id)
+        elif action == "tiktok-cancel":
+            attempt = publisher.cancel(attempt_id)
+        else:
+            attempt = publisher.retry(attempt_id)
+        return f"TikTok publication state is now {attempt['state']}."
+
+    def _tiktok_account_action(self, path: str) -> None:
+        publisher = self.server.app.tiktok_publications
+        if publisher is None:
+            self._text(HTTPStatus.NOT_FOUND, "TikTok publication is not configured.")
+            return
+        try:
+            form = self._form()
+            self._require_token(form)
+            if path == "/tiktok/connect":
+                self._external_redirect(publisher.authorization_url())
+                return
+            if path == "/tiktok/disconnect":
+                publisher.disconnect()
+                self._redirect("success", "TikTok account disconnected.")
+                return
+            account = publisher.complete_oauth(
+                code=self._one(form, "code", required=True) or "",
+                state=self._one(form, "state", required=True) or "",
+            )
+            self._redirect(
+                "success", f"Connected TikTok account {account['display_name']}."
+            )
+        except RequestError as error:
+            self._text(error.status, error.message)
+        except (PublicationError, OSError, ValueError) as error:
+            self.log_error("sanitized TikTok account action failed: %s", error)
+            self._redirect("error", "The TikTok account action failed safely.")
+
+    def _tiktok_oauth_callback(self, query: str, *, head: bool) -> None:
+        values = parse_qs(query, keep_blank_values=True)
+        code = values.get("code", [""])[0]
+        state = values.get("state", [""])[0]
+        error = values.get("error", [""])[0]
+        if error or not code or not state or len(code) > 2048 or len(state) > 512:
+            self._text(
+                HTTPStatus.BAD_REQUEST,
+                "TikTok authorization did not complete. No credentials were stored.",
+                head=head,
+            )
+            return
+        body = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Complete TikTok connection</title></head><body>
+<h1>Complete TikTok connection</h1>
+<p>Confirm the one-time authorization exchange. The account will be shown before
+any clip can be sent.</p>
+<form method="post" action="/tiktok/oauth/complete">
+<input type="hidden" name="form_token" value="{_e(self.server.app.form_token)}">
+<input type="hidden" name="code" value="{_e(code)}">
+<input type="hidden" name="state" value="{_e(state)}">
+<button>Complete connection</button></form></body></html>""".encode()
+        self._headers(HTTPStatus.OK, "text/html; charset=utf-8", len(body))
+        if not head:
+            self.wfile.write(body)
+
+    def _external_redirect(self, location: str) -> None:
+        target = urlsplit(location)
+        if target.scheme != "https" or target.hostname != "www.tiktok.com":
+            raise TikTokError("Refusing an unexpected TikTok authorization URL.")
+        self.send_response(HTTPStatus.SEE_OTHER)
+        for name, value in SECURITY_HEADERS.items():
+            self.send_header(name, value)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        """Never place OAuth query values in access logs."""
+
+        path = urlsplit(self.path).path
+        self.log_message('"%s %s %s" %s %s', self.command, path,
+                         self.request_version, str(code), str(size))
 
     def _reference_decision(self, video_id: str, _route: str) -> None:
         queue = self.server.app.reference_candidate_queue
@@ -694,6 +827,11 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 _sorted(items), document["updated_at"], self.server.app.form_token,
                 maximum_duration=self.server.app.maximum_duration,
                 comparison_reports=self._comparison_reports(items),
+                publication_contexts=self._publication_contexts(items),
+                tiktok_connection=(
+                    self.server.app.tiktok_publications.connection()
+                    if self.server.app.tiktok_publications is not None else None
+                ),
                 notice=parameters.get("success", parameters.get("error", [None]))[0],
                 notice_error="error" in parameters,
             ).encode()
@@ -704,6 +842,17 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         self._headers(HTTPStatus.OK, "text/html; charset=utf-8", len(body))
         if not head:
             self.wfile.write(body)
+
+    def _publication_contexts(
+        self, items: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        publisher = self.server.app.tiktok_publications
+        if publisher is None:
+            return {}
+        return {
+            item["review_id"]: publisher.review_context(item)
+            for item in items if item["status"] == "approved"
+        }
 
     def _comparison_reports(self, items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         comparator = self.server.app.reference_comparator
@@ -1001,14 +1150,18 @@ def render_index(
     maximum_duration: float = 60.0,
     notice: str | None = None, notice_error: bool = False,
     comparison_reports: dict[str, dict[str, Any]] | None = None,
+    publication_contexts: dict[str, dict[str, Any]] | None = None,
+    tiktok_connection: dict[str, Any] | None = None,
 ) -> str:
     comparison_reports = comparison_reports or {}
+    publication_contexts = publication_contexts or {}
     sections: list[str] = []
     for status in ("pending", "approved", "rejected"):
         cards = [
             _card(
                 item, form_token, maximum_duration,
                 comparison_reports.get(item["review_id"]),
+                publication_contexts.get(item["review_id"]),
             )
             for item in items if item["status"] == status
         ]
@@ -1021,6 +1174,7 @@ def render_index(
         f'<p class="notice {"error" if notice_error else "success"}">{_e(notice)}</p>'
         if notice else ""
     )
+    connection = _tiktok_connection(tiktok_connection, form_token)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1040,6 +1194,7 @@ textarea{{width:100%;min-height:5rem}}fieldset{{margin:.8rem 0;padding:.8rem}}la
 <p><a href="/reference-candidates">Review discovered reference candidates</a></p>
 <p><a href="/references">Inspect and annotate accepted references</a></p>
 <p>Queue updated: {_e(updated_at)}</p>
+{connection}
 <form method="get" action="/"><label>Status <select name="status"><option value="">All</option>
 <option>pending</option><option>approved</option><option>rejected</option></select></label>
 <label>Video ID <input name="video_id"></label><button type="submit">Filter</button></form></header>
@@ -1359,6 +1514,7 @@ explicit and never alter production selection or rendering defaults.</p></header
 def _card(
     item: dict[str, Any], token: str, maximum_duration: float,
     comparison: dict[str, Any] | None = None,
+    publication: dict[str, Any] | None = None,
 ) -> str:
     review_id = quote(str(item["review_id"]), safe="")
     adjusted = bool(
@@ -1371,6 +1527,7 @@ def _card(
     )
     hidden = f'<input type="hidden" name="form_token" value="{_e(token)}">'
     comparison_html = _comparison_section(comparison)
+    publication_html = _publication_section(item, token, publication)
     return f"""<article class="card"><div>
 <video controls preload="metadata" src="/media/{review_id}">Your browser cannot play this local preview.</video>
 </div><div><h3>Rank {_e(item['candidate_rank'])} · score {_e(item['candidate_score'])}</h3>
@@ -1390,6 +1547,7 @@ def _card(
 <strong>Later manually adjusted:</strong> {'Yes' if item['timing_source'] == 'manual' else 'No'}<br>
 <strong>Preview metadata path:</strong> {_e(item['preview_metadata_path'])}</p>{pending_adjusted}
 {comparison_html}
+{publication_html}
 <form method="post" action="/reviews/{review_id}/compare-reference"><fieldset>
 <legend>Reference comparison</legend>{hidden}
 <p>Runs measurable and transcript-heuristic comparison locally. It does not rerender or change review state.</p>
@@ -1420,6 +1578,109 @@ Use either relative or absolute fields, not both.</p><div class="timing-grid">
 <p>Rerenders synchronously using the reaction profile and returns this item to pending.</p>
 <button type="submit">Reapply Automatic Context</button></fieldset></form>
 </div></article>"""
+
+
+def _tiktok_connection(connection: dict[str, Any] | None, token: str) -> str:
+    if connection is None:
+        return ""
+    hidden = f'<input type="hidden" name="form_token" value="{_e(token)}">'
+    if not connection.get("enabled"):
+        return (
+            "<section><h2>TikTok inbox drafts</h2><p>Disabled. Approval never "
+            "uploads a clip. Configure the official integration after merge to "
+            "enable explicit inbox delivery.</p></section>"
+        )
+    account = connection.get("account")
+    if account:
+        return f"""<section><h2>TikTok inbox drafts</h2>
+<p>Connected account: <strong>{_e(account['display_name'])}</strong>. Every clip
+requires its own rights confirmation and immediate send confirmation.</p>
+<form method="post" action="/tiktok/disconnect">{hidden}
+<button>Disconnect TikTok</button></form></section>"""
+    return f"""<section><h2>TikTok inbox drafts</h2>
+<p>Connect with TikTok Login Kit. No clip is selected or uploaded by connecting.</p>
+<form method="post" action="/tiktok/connect">{hidden}
+<button>Connect TikTok</button></form></section>"""
+
+
+def _publication_section(
+    item: dict[str, Any], token: str,
+    context: dict[str, Any] | None,
+) -> str:
+    if item["status"] != "approved" or context is None:
+        return ""
+    hidden = f'<input type="hidden" name="form_token" value="{_e(token)}">'
+    attempt = context.get("attempt")
+    account = context.get("account")
+    checksum = context.get("checksum")
+    creator = context.get("source_creator") or "Source creator unavailable"
+    connected = bool(context.get("enabled") and context.get("connected") and account)
+    account_name = account.get("display_name") if account else "Not connected"
+    summary = f"""<section><h4>TikTok inbox draft</h4>
+<p><strong>Source creator:</strong> {_e(creator)} ·
+<strong>Clip duration:</strong> {_e(item['render_duration'])}s ·
+<strong>Timing revision:</strong> {_e(item['timing_revision'])}<br>
+<strong>Final-render SHA-256:</strong> {_e(checksum or 'unavailable')}<br>
+<strong>Connection:</strong> {_e('connected' if connected else 'not connected or disabled')} ·
+<strong>Authorized destination:</strong> {_e(account_name)}<br>
+<strong>Cleanup eligible:</strong> {_e('yes' if context.get('cleanup_eligible') else 'no')}</p>
+<p>Inbox delivery is not a public post. You must open TikTok, edit as needed,
+and complete the final post yourself.</p>"""
+    if not connected:
+        return summary + "<p>Connect the official TikTok integration above first.</p></section>"
+    if attempt is None or attempt.get("stale") or attempt.get("state") in {
+        "cancelled", "failed_terminal", "publish_complete",
+    }:
+        prior = ""
+        if attempt:
+            prior = (
+                f"<p><strong>Previous state:</strong> {_e(attempt['state'])} · "
+                f"<strong>Stale:</strong> {_e('yes' if attempt['stale'] else 'no')} · "
+                f"<strong>Failure:</strong> {_e(attempt.get('error_reason') or 'none')}</p>"
+            )
+        return summary + prior + f"""
+<form method="post" action="/reviews/{quote(str(item['review_id']), safe='')}/tiktok-prepare">
+{hidden}<fieldset><legend>Prepare only — no upload</legend>
+<label>Intended caption and hashtags (copy or finalize in TikTok)
+<textarea name="caption" maxlength="2200" required>{_e(item['candidate_text'])}</textarea></label>
+<label>Editable source attribution
+<input name="source_attribution" maxlength="1000" value="Source: {_e(creator)}" required></label>
+<label><input type="checkbox" name="rights_confirmed" value="yes" required>
+I confirm I am authorized to republish this clip. AutoClip does not claim permission or fair use.</label>
+<button>Prepare TikTok draft</button></fieldset></form></section>"""
+
+    state = attempt["state"]
+    details = f"""<p><strong>Publication state:</strong> {_e(state)} ·
+<strong>Last update:</strong> {_e(attempt['updated_at'])}<br>
+<strong>Caption:</strong> {_e(attempt['caption'])}<br>
+<strong>Attribution:</strong> {_e(attempt['source_attribution'])}<br>
+<strong>Prepared checksum:</strong> {_e(attempt['rendered_media_sha256'])}<br>
+<strong>Remote publish ID:</strong> {_e(attempt.get('remote_publish_id') or 'not assigned')}<br>
+<strong>Sanitized failure:</strong> {_e(attempt.get('error_reason') or 'none')}</p>"""
+    action = ""
+    encoded = quote(str(item["review_id"]), safe="")
+    attempt_field = (
+        f'<input type="hidden" name="attempt_id" value="{_e(attempt["attempt_id"])}">'
+    )
+    if state == "awaiting_consent":
+        action = f"""<form method="post" action="/reviews/{encoded}/tiktok-send">
+{hidden}{attempt_field}<fieldset><legend>Immediate upload confirmation</legend>
+<p>Send clip <strong>{_e(item['review_id'])}</strong>, revision
+<strong>{_e(item['timing_revision'])}</strong>, to
+<strong>{_e(account_name)}</strong>. Intended caption for finalization in TikTok:</p>
+<blockquote>{_e(attempt['caption'])}</blockquote>
+<label><input type="checkbox" name="confirm_upload" value="yes" required>
+Send this exact approved render to the TikTok inbox now.</label>
+<button>Send to TikTok inbox</button></fieldset></form>
+<form method="post" action="/reviews/{encoded}/tiktok-cancel">{hidden}{attempt_field}
+<button>Cancel prepared attempt</button></form>"""
+    elif state == "failed_retryable":
+        action = f"""<form method="post" action="/reviews/{encoded}/tiktok-retry">
+{hidden}{attempt_field}<button>Reconcile and retry verified failure</button></form>"""
+    elif state not in {"publish_complete", "failed_terminal", "cancelled"}:
+        action = f"""<form method="post" action="/reviews/{encoded}/tiktok-refresh">
+{hidden}{attempt_field}<button>Refresh TikTok status</button></form>"""
+    return summary + details + action + "</section>"
 
 
 def _comparison_section(report: dict[str, Any] | None) -> str:
@@ -1525,11 +1786,21 @@ def create_application(args: argparse.Namespace) -> ReviewApplication:
         profile_builder=profile_builder,
     )
     batches = ReviewComparisonBatchService(queue, profile_builder, comparator)
+    tiktok_publications = TikTokPublicationService.from_environment(
+        queue, renderer.manifest
+    )
     return ReviewApplication(
-        queue, service, secrets.token_urlsafe(32), args.maximum_render_duration,
-        comparator, args.reference_profile, candidate_queue, discovery_service,
-        evidence_service,
-        batches,
+        queue=queue,
+        timing_service=service,
+        form_token=secrets.token_urlsafe(32),
+        maximum_duration=args.maximum_render_duration,
+        reference_comparator=comparator,
+        reference_profile=args.reference_profile,
+        reference_candidate_queue=candidate_queue,
+        reference_discovery_service=discovery_service,
+        reference_evidence_service=evidence_service,
+        comparison_batches=batches,
+        tiktok_publications=tiktok_publications,
     )
 
 

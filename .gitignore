@@ -45,6 +45,15 @@ data/reference_discovery/decision_events.jsonl
 data/reference_discovery/withdrawal_recovery/
 data/production/
 data/logs/production.jsonl
+data/publication/
+data/media_cleanup/
+data/quarantine/
+data/**/cleanup.lock
+data/**/publication*.lock
+data/**/.cleanup-*
+data/**/.quarantine-*
+tiktok_tokens.json
+tiktok_oauth_states.json
 data/reference_clips/**/.analysis.*
 data/reference_clips/**/.scene-detect.*
 data/reference_clips/**/.silence-detect.*
@@ -61,6 +70,8 @@ data/reference_clips/**/.silence-detect.*
 .reviews.*
 .review-index.*
 .batch-preview.*
+.media-cleanup.*
+.publication.*
 
 # macOS
 .DS_Store

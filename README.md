@@ -6,7 +6,7 @@ CreatorFlow is an AI-powered content clipping platform that automatically:
 - Detects the best moments using AI
 - Creates vertical videos
 - Generates captions
-- Publishes to TikTok, YouTube Shorts, and Instagram Reels
+- Supports consent-driven export workflows for social platforms
 
 ## Status
 
@@ -231,7 +231,7 @@ sudo loginctl enable-linger aasandoval
 ```
 
 Without lingering, the enabled units start when the user logs in rather than
-unattended at boot. No service in this layer publishes clips, changes selection
+unattended at boot. No unattended service action publishes clips, changes selection
 or rendering behavior, exposes the review server publicly, or modifies SSH,
 UFW, WireGuard, router, or Cloudflare configuration.
 
@@ -441,11 +441,56 @@ Do not bind this administrative page publicly. `--allow-non-loopback` exists
 only for an explicitly secured environment and prints a strong warning. The
 random per-process form token protects local write requests, but it is not
 authentication and is not a substitute for loopback isolation or an SSH
-tunnel. The page loads no external resources and the server performs no
-external network requests.
+tunnel. The page loads no external resources. Ordinary review actions perform
+no external network requests; the separately enabled TikTok connect, send, and
+status actions are the explicit exception.
 
-Approval is local review state only. Neither the interactive page, the CLI,
-nor the static index uploads, schedules, or publishes a clip anywhere.
+Approval is local review state only. It never uploads or schedules a clip.
+When the separately configured TikTok integration is enabled, only the
+interactive page's explicit rights-confirmed and immediately confirmed inbox
+action can transfer one approved current render. The static index and ordinary
+review CLI never upload anything.
+
+## Media retention and TikTok inbox drafts
+
+CreatorFlow has an ownership-aware, two-stage media-retention workflow and a
+platform-neutral publication ledger. Both are conservative by default:
+
+- Cleanup planning considers review decisions, timing revisions, checksums,
+  publication states, references, comparisons, and recovery evidence—not age
+  alone.
+- Applying a cleanup plan is a dry run unless `--execute` is supplied. An
+  executed apply atomically moves revalidated files into local quarantine;
+  permanent purge is a separate confirmed command after the grace period.
+- Approved but unpublished media, unresolved or failed publication work,
+  reference media, and recovery evidence are retained.
+- TikTok is disabled unless explicitly configured. Approval and preparation do
+  not upload. Sending requires a second, immediate confirmation naming the
+  account, clip, caption, and timing revision.
+- The official TikTok inbox Upload API is used, not Direct Post. Inbox delivery
+  is not treated as public publication; the operator must finish the draft in
+  TikTok, and cleanup waits for TikTok's verified `PUBLISH_COMPLETE` state.
+
+Create and inspect a checksum-pinned cleanup plan:
+
+```bash
+.venv/bin/python -m backend.app.media_cleanup plan
+.venv/bin/python -m backend.app.media_cleanup show --plan-id PLAN_ID
+```
+
+Preview an apply without moving anything (the default):
+
+```bash
+.venv/bin/python -m backend.app.media_cleanup apply \
+  --plan-id PLAN_ID --confirm PLAN_ID
+```
+
+The optional `creatorflow-cleanup.service` and `.timer` templates support a
+future quarantine-only schedule, but normal installation and deployment do
+not install, enable, or start them. See
+[`docs/media-lifecycle-and-tiktok.md`](docs/media-lifecycle-and-tiktok.md) for
+the ownership graph, exact retention rules, recovery commands, TikTok app
+configuration, controlled first-upload procedure, and security limitations.
 
 ## Accepted clip references
 

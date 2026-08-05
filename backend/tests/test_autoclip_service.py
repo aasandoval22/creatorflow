@@ -131,6 +131,30 @@ def test_install_preserves_existing_environment_file(tmp_path):
     assert service.environment_file.read_text() == "AUTOCLIP_PRODUCTION_ARGS=--top 1\n"
 
 
+def test_optional_cleanup_units_install_disabled_and_persistent(tmp_path):
+    service, commands = manager(tmp_path)
+    result = service.install_cleanup()
+    assert sorted(result["changed_units"]) == sorted(
+        autoclip_service.OPTIONAL_CLEANUP_UNITS
+    )
+    assert result["enabled"] is False
+    timer = (service.unit_directory / autoclip_service.CLEANUP_TIMER).read_text()
+    unit = (service.unit_directory / autoclip_service.CLEANUP_SERVICE).read_text()
+    assert "Persistent=true" in timer and "RandomizedDelaySec=2h" in timer
+    assert "run-eligible --execute" in unit
+    assert not any("enable" in command for command in commands.commands)
+
+
+def test_install_cleanup_command_explicitly_reports_disabled(tmp_path):
+    service, _ = manager(tmp_path)
+    output = StringIO()
+    assert autoclip_service.main(
+        ["install-cleanup"], manager=service,
+        stdout=output, stderr=StringIO(),
+    ) == 0
+    assert "remains disabled and stopped" in output.getvalue()
+
+
 def test_systemd_unavailable_is_actionable(tmp_path):
     service, _ = manager(tmp_path, FakeCommands(supported=False))
     with pytest.raises(ServiceManagerError, match="systemd user services are unavailable"):
